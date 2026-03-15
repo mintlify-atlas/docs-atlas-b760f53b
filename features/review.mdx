@@ -1,0 +1,183 @@
+---
+title: "Review"
+description: "How to inspect, review, and merge agent-generated pull requests from the Dev0 mission control UI."
+---
+
+Once an agent task completes successfully, the orchestrator opens a GitHub pull request and transitions the task to `REVIEW` status. Engineers review the generated code from the Dev0 mission control UI before deciding whether to merge.
+
+## How a task reaches REVIEW
+
+After the Gemini CLI exits with code `0` and `finalizeTaskChanges` successfully opens a PR, `completeTask` is called with `success: true`:
+
+```typescript
+await db
+  .update(tasks)
+  .set({
+    status: 'REVIEW',
+    prUrl: result.prUrl ?? null,
+  })
+  .where(eq(tasks.id, taskId))
+
+void getRealtimeChannel(projectId).emit('execution.task_review', {
+  projectId,
+  taskId,
+  prUrl: result.prUrl,
+})
+```
+
+The task's `prUrl` and `prNumber` are stored on the task record. The `execution.task_review` realtime event notifies the UI instantly.
+
+## The review view
+
+The review tab in mission control lists all tasks that have an associated PR. For each PR you can:
+
+<CardGroup cols={2}>
+  <Card title="PR summary" icon="file-lines">
+    Title, description, state (`open`, `closed`, or `merged`), branch names, addition/deletion counts, file count, commit count, and threaded comments from both the agent and human reviewers.
+  </Card>
+  <Card title="Files changed" icon="code-compare">
+    File-by-file diff with patch hunks, per-file addition/deletion counts, and file status (`added`, `modified`, `removed`, `renamed`, etc.).
+  </Card>
+  <Card title="Merge PR" icon="code-merge">
+    Squash-merges the pull request via the GitHub API and marks the task `DONE`. The next `PENDING` task in the graph then becomes eligible for execution.
+  </Card>
+  <Card title="Open on GitHub" icon="github">
+    Navigate to the full GitHub pull request for inline comments, reviews, CI status checks, and other features not exposed in mission control.
+  </Card>
+</CardGroup>
+
+## Server actions
+
+All review data is fetched and mutated through TanStack Start server functions in `src/lib/actions/review.ts`.
+
+### `getReviewPRList`
+
+Returns all tasks for a project that have an associated PR, ordered by phase and task order.
+
+```typescript
+export const getReviewPRList = createServerFn({ method: 'GET' })
+  .inputValidator(z.object({ projectId: z.string() }))
+  .handler(async ({ data }): Promise<ReviewPRListItem[]> => { ... })
+```
+
+Each item in the list is a `ReviewPRListItem`:
+
+```typescript
+export type ReviewPRListItem = {
+  taskId: string
+  taskTitle: string
+  taskStatus: TaskStatus
+  taskPhase: number
+  taskCreatedAt: string
+  geminiModel: string
+  prNumber: number
+  prUrl: string
+  prTitle?: string | null
+  prState?: 'open' | 'closed' | 'merged'
+  prUpdatedAt?: string | null
+}
+```
+
+### `getReviewPRSummary`
+
+Fetches full PR metadata and comments for a specific task.
+
+```typescript
+export const getReviewPRSummary = createServerFn({ method: 'GET' })
+  .inputValidator(z.object({ projectId: z.string(), taskId: z.string() }))
+  .handler(async ({ data }): Promise<ReviewPRSummary | null> => { ... })
+```
+
+Returns a `ReviewPRSummary` including merged issue comments and review comments, sorted chronologically:
+
+```typescript
+export type ReviewPRSummary = {
+  taskId: string
+  prNumber: number
+  title: string
+  body: string | null
+  state: 'open' | 'closed' | 'merged'
+  createdAt: string
+  updatedAt: string
+  headBranch: string
+  baseBranch: string
+  additions: number
+  deletions: number
+  changedFiles: number
+  commits: number
+  comments: ReviewPRComment[]
+}
+```
+
+Comments are annotated with `authorType: 'agent' | 'user'` — comments from `GITHUB_BOT_USERNAME` are marked as agent comments.
+
+### `getReviewPRFiles`
+
+Fetches the file diff for a PR by comparing the base and head commit SHAs.
+
+```typescript
+export const getReviewPRFiles = createServerFn({ method: 'GET' })
+  .inputValidator(z.object({ projectId: z.string(), taskId: z.string() }))
+  .handler(async ({ data }): Promise<ReviewPRFile[]> => { ... })
+```
+
+Each file entry:
+
+```typescript
+export type ReviewPRFile = {
+  filename: string
+  status: 'added' | 'modified' | 'removed' | 'renamed' | 'copied' | 'changed'
+  additions: number
+  deletions: number
+  changes: number
+  sha: string
+  patch?: string | null
+  previousFilename?: string | null
+}
+```
+
+### `mergePullRequest`
+
+Squash-merges the PR and updates the task status to `DONE`.
+
+```typescript
+export const mergePullRequest = createServerFn({ method: 'POST' })
+  .inputValidator(z.object({ projectId: z.string(), taskId: z.string() }))
+  .handler(async ({ data }): Promise<{ success: boolean; message: string }> => { ... })
+```
+
+Internally it calls `github.mergePullRequest` with `mergeMethod: 'squash'`, then updates the task:
+
+```typescript
+await github.mergePullRequest({
+  repoName: prContext.ref.repoName,
+  prNumber: prContext.ref.prNumber,
+  mergeMethod: 'squash',
+})
+
+await db
+  .update(tasks)
+  .set({ status: 'DONE' })
+  .where(eq(tasks.id, data.taskId))
+```
+
+## GitHub integration
+
+All GitHub operations use the `GitHubProvider` class from `src/lib/git/github`, which wraps `octokit` under the hood. The provider authenticates using `GITHUB_TOKEN` and operates under the `GITHUB_BOT_USERNAME` account.
+
+PR references are resolved from either:
+- The `prUrl` column on the task (parsed with a regex to extract owner, repo, and PR number)
+- The `prNumber` column combined with the project's `repoName`
+
+## Task state transitions
+
+```
+RUNNING → REVIEW    (agent completes, PR opened)
+REVIEW  → DONE      (PR merged via mergePullRequest)
+```
+
+Once a task reaches `DONE`, the next `PENDING` task in the graph becomes eligible for execution — dependencies are resolved and the pipeline continues.
+
+<Note>
+  `DONE` and `SKIPPED` are the only terminal states that satisfy dependency requirements for downstream tasks.
+</Note>

@@ -1,0 +1,229 @@
+---
+title: "Git Automation"
+description: "How Dev0 commits agent changes, pushes branches, and opens GitHub pull requests — including branch naming, authentication, and the agent-result.json contract."
+---
+
+After a successful Gemini CLI execution, the orchestrator takes over git operations inside the sandbox. The agent itself is explicitly prohibited from running `git commit`, `git push`, or `gh pr create` — these are orchestrator responsibilities.
+
+## Overview
+
+All git automation happens inside `finalizeTaskChanges` in `src/lib/execution/orchestrator.ts`. The function receives the sandbox ID, task, project, and the agent's `agent-result.json` output.
+
+## Pre-execution: `syncRepoToDefaultBranch`
+
+Before the agent runs, the orchestrator syncs the sandbox to the latest state of the default branch:
+
+```typescript
+async function syncRepoToDefaultBranch(
+  sandboxId: string,
+  logger: ReturnType<typeof createTaskLogger>,
+): Promise<void>
+```
+
+<Steps>
+  <Step title="git fetch origin --prune">
+    Fetches all remote branches and prunes deleted ones.
+  </Step>
+  <Step title="Resolve default branch">
+    `git symbolic-ref refs/remotes/origin/HEAD --short` returns the default branch (e.g. `origin/main`). Strips the `origin/` prefix.
+  </Step>
+  <Step title="git checkout {defaultBranch}">
+    Checks out the default branch in the sandbox.
+  </Step>
+  <Step title="git pull --ff-only origin {defaultBranch}">
+    Fast-forward only pull to advance to the latest commit. If this fails (diverged history), the function continues — the rebase in `finalizeTaskChanges` will handle it.
+  </Step>
+</Steps>
+
+## `finalizeTaskChanges` Step-by-Step
+
+```typescript
+async function finalizeTaskChanges(
+  sandboxId: string,
+  task: Task,
+  project: { repoUrl: string | null; repoName: string | null },
+  agentResult: {
+    status: 'success' | 'failed'
+    commitMessage?: string
+    prTitle?: string
+    prBody?: string
+  } | null,
+  logger: ReturnType<typeof createTaskLogger>,
+): Promise<{ prUrl?: string; error?: string }>
+```
+
+<Steps>
+  <Step title="Build authenticated remote URL">
+    `withGithubToken(repoUrl, repoName)` injects `x-access-token:{GITHUB_TOKEN}` into the GitHub URL:
+
+    ```typescript
+    parsed.username = 'x-access-token'
+    parsed.password = env.GITHUB_TOKEN
+    // result: https://x-access-token:{token}@github.com/{owner}/{repo}.git
+    ```
+
+    The token is never logged — only `hasToken: remoteUrl.includes('x-access-token')` is written to logs.
+  </Step>
+  <Step title="git remote set-url origin">
+    ```bash
+    git remote set-url origin "https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+    ```
+
+    Replaces the origin URL in the sandbox with the authenticated version so all subsequent git operations can push without a credential prompt.
+  </Step>
+  <Step title="git config user.email / user.name">
+    ```bash
+    git config user.email "dev0-agent@users.noreply.github.com"
+    git config user.name "dev0-agent"
+    ```
+
+    Sets the bot identity for commits. Commits will appear authored by `dev0-agent`.
+  </Step>
+  <Step title="git checkout -B dev0/task-{taskId}">
+    ```bash
+    git checkout -B "dev0/task-{task.id}"
+    ```
+
+    Creates or resets the task branch. The `-B` flag resets the branch to the current HEAD if it already exists (handles retries cleanly).
+  </Step>
+  <Step title="git fetch origin --prune + resolve default branch">
+    Fetches remote state again to get the latest default branch tip for rebasing.
+
+    ```bash
+    git fetch origin --prune
+    git symbolic-ref refs/remotes/origin/HEAD --short
+    ```
+  </Step>
+  <Step title="git rebase origin/{defaultBranch}">
+    ```bash
+    git rebase "origin/{defaultBranch}"
+    ```
+
+    Rebases the task branch on top of the latest default branch. If this fails (conflict), the orchestrator runs `git rebase --abort` and logs a warning, then continues — the push may still succeed if there are no actual conflicts with the staged changes.
+  </Step>
+  <Step title="git add -A">
+    ```bash
+    git add -A
+    ```
+
+    Stages all changes (new files, modifications, deletions).
+  </Step>
+  <Step title="Check for staged changes">
+    ```bash
+    git diff --cached --quiet
+    ```
+
+    Exit code `0` means no staged changes → returns `{ error: 'No changes to commit' }`. Exit code `1` means changes are staged and we proceed.
+  </Step>
+  <Step title="git commit">
+    ```bash
+    git -c core.compression=0 -c http.compression=0 -c http.version=HTTP/1.1 \
+      commit -m "{commitMessage}"
+    ```
+
+    The compression flags work around E2B sandbox networking quirks. The commit message comes from `agentResult.commitMessage`, falling back to `feat: complete task {task.title}`.
+  </Step>
+  <Step title="git push">
+    ```bash
+    GIT_HTTP_VERSION=HTTP/1.1 git -c core.compression=0 -c http.compression=0 \
+      -c http.version=HTTP/1.1 push -u origin "dev0/task-{task.id}"
+    ```
+
+    Pushes the branch and sets the upstream tracking reference.
+  </Step>
+  <Step title="gh pr create">
+    ```bash
+    GODEBUG=http2client=0 GH_PAGER=cat GIT_HTTP_VERSION=HTTP/1.1 \
+      gh pr create --title "{prTitle}" --body "{prBody}"
+    ```
+
+    Creates the GitHub pull request. `GH_PAGER=cat` prevents `gh` from opening a pager. `GODEBUG=http2client=0` forces HTTP/1.1 inside the sandbox. The PR URL is extracted from stdout with a regex and stored in `tasks.prUrl`.
+  </Step>
+</Steps>
+
+## Branch Naming Convention
+
+```
+dev0/task-{taskId}
+```
+
+Where `taskId` is the UUID from the `tasks` table. Using the full UUID ensures uniqueness across projects and retries. The branch is created fresh (or reset with `-B`) on every execution attempt.
+
+## `agent-result.json` Contract
+
+The agent writes this file to `$HOME/project/.dev0/runs/{taskId}/agent-result.json` at the end of every run. The orchestrator reads it after the Gemini CLI exits:
+
+```typescript
+await readAgentResult(sandboxId, agentResultPath)
+// Returns:
+{
+  status: 'success' | 'failed'
+  commitMessage?: string  // used as git commit -m
+  prTitle?: string        // used as gh pr create --title
+  prBody?: string         // used as gh pr create --body
+  notes?: string          // informational, logged but not used
+}
+```
+
+If `agent-result.json` is missing or malformed, the orchestrator falls back to generated defaults:
+
+| Field | Fallback |
+|---|---|
+| `commitMessage` | `feat: complete task {task.title}` |
+| `prTitle` | `feat: {task.title}` |
+| `prBody` | `''` (empty string) |
+
+The agent is instructed in its prompt:
+
+```
+Write a JSON file at {runDir}/agent-result.json with:
+{"status":"success|failed","commitMessage":"...","prTitle":"...","prBody":"...","notes":"..."}
+```
+
+## Security: Token Handling
+
+<Warning>
+  The GitHub token is injected into the remote URL as `x-access-token:{token}`. It is never written to disk in plaintext or included in log output. The `redactSecret` utility in `e2b.ts` replaces any token appearance in error messages with `***`.
+</Warning>
+
+The pattern used:
+
+```typescript
+function withGithubToken(
+  repoUrl: string | null,
+  repoName: string | null,
+): string {
+  // ...
+  parsed.username = 'x-access-token'
+  parsed.password = env.GITHUB_TOKEN
+  return parsed.toString()
+  // produces: https://x-access-token:ghp_xxx@github.com/owner/repo.git
+}
+```
+
+This is the standard GitHub token authentication pattern for HTTPS git operations. The token is only active for the duration of the sandbox session and never committed to the repository.
+
+## GitHub API via octokit
+
+For repo creation and management (not task execution), Dev0 uses `GitHubProvider` from `src/lib/git/github.ts` which wraps the `octokit` REST client:
+
+```typescript
+export class GitHubProvider {
+  private octokit: Octokit
+  private owner: string
+
+  constructor() {
+    this.octokit = new Octokit({ auth: env.GITHUB_TOKEN })
+    this.owner = env.GITHUB_BOT_USERNAME
+  }
+
+  async createFromTemplate(options: CreateRepoFromTemplateOptions): Promise<RepoInfo>
+  async createInitialFiles(options: CreateInitialFilesOptions): Promise<void>
+  async createPullRequest(options: CreatePullRequestOptions): Promise<PullRequestInfo>
+  async mergePullRequest(options: MergePullRequestOptions): Promise<void>
+  async getRepository(repoName: string): Promise<RepoInfo>
+  // ...
+}
+```
+
+The `GITHUB_BOT_USERNAME` env var (default: `dev0-agent`) is used as the repository owner for all `octokit` operations.

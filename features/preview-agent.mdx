@@ -1,0 +1,154 @@
+---
+title: "Preview agent"
+description: "How Dev0 turns a rough product idea into a structured project preview using Gemini 3 Flash."
+---
+
+The preview agent is the first step in the Dev0 pipeline. It takes a freeform idea — a *vibe* — and produces structured project metadata: a name, tagline, description, and recommended tech stack. This happens before any project is created or any code is written.
+
+## What it does
+
+The preview agent acts as a technical product strategist. Given raw text input, it extracts:
+
+- A **catchy, memorable project name** (2–4 words, PascalCase or spaced)
+- A **punchy tagline** summarizing the project in 10 words or fewer
+- A **concise description** (2–3 sentences, max 300 characters) preserving key requirements, theme/styling cues, target users, and constraints
+- A **suggested tech stack** (currently always `react-vite` for stability)
+
+<Note>
+  The preview step is intentionally fast and low-cost. It uses `gemini-3-flash-preview` to deliver near-instant feedback as you type.
+</Note>
+
+## Model
+
+The preview agent uses `gemini-3-flash-preview`, exported from `src/lib/ai/models.ts` as `GEMINI_3_FLASH`.
+
+The model runs with `temperature: 0.7` to encourage creative but practical naming, and uses the Vercel AI SDK's `Output.object` mode to enforce structured output validated against a Zod schema.
+
+## Output schema
+
+The output is validated against `previewOutputSchema` defined in `src/lib/ai/schemas.ts`:
+
+```typescript
+export const previewOutputSchema = z.object({
+  name: z
+    .string()
+    .describe(
+      'A catchy, memorable project name (2-4 words, PascalCase or with spaces)',
+    ),
+  tagline: z
+    .string()
+    .describe('A short, punchy tagline summarizing the project (max 10 words)'),
+  description: z
+    .string()
+    .describe(
+      'A concise 2-3 sentence description (max 300 characters) that preserves key requirements, theme/styling cues, and constraints',
+    ),
+  suggestedTechStack: z
+    .enum(['tanstack-start', 'react-vite', 'nextjs'])
+    .describe(
+      'The recommended tech stack based on the project requirements. Use react-vite for now; other stacks are disabled for stability',
+    ),
+})
+
+export type PreviewOutput = z.infer<typeof previewOutputSchema>
+```
+
+<Info>
+  `tanstack-start` and `nextjs` are defined in the enum but the planner system prompt instructs the model to always recommend `react-vite` until other stacks are re-enabled for stability.
+</Info>
+
+## The `getPreview` server action
+
+`getPreview` is a TanStack Start server function defined in `src/lib/actions/preview.ts`. It validates input, calls the preview agent, and returns the structured output or throws on failure.
+
+```typescript
+export const getPreview = createServerFn({ method: 'POST' })
+  .inputValidator(previewInputSchema)
+  .handler(async ({ data }: { data: PreviewInput }) => {
+    const result = await generatePreview({ vibeInput: data.vibeInput })
+
+    if (!result.success) {
+      throw new Error(result.error)
+    }
+
+    return result.data
+  })
+```
+
+The input validator requires `vibeInput` to be at least 10 characters, enforcing a minimum level of detail before calling the model.
+
+## Voice input and transcription
+
+The home screen also supports spoken input. Audio is captured in the browser and sent to the `transcribe` server action (`src/lib/actions/transcribe.ts`), which calls `transcribeAudio` from `src/lib/ai/transcribe`. The transcription result is then passed to `getPreview` as `vibeInput`.
+
+The transcription action accepts base64-encoded audio and a media type:
+
+```typescript
+export const transcribe = createServerFn({ method: 'POST' })
+  .inputValidator(transcribeInputSchema)
+  .handler(async ({ data, signal }) => {
+    const buffer = Buffer.from(data.audioBase64, 'base64')
+    const result = await transcribeAudio({
+      audioBuffer: buffer.buffer.slice(
+        buffer.byteOffset,
+        buffer.byteOffset + buffer.byteLength,
+      ),
+      mediaType: data.mediaType,
+      signal,
+    })
+
+    if (!result.success) {
+      throw new Error(result.error)
+    }
+
+    return { text: result.text }
+  })
+```
+
+## UX flow
+
+<Steps>
+  <Step title="Enter or speak an idea">
+    You type a freeform product idea into the home screen input, or click the microphone button to record a voice description.
+  </Step>
+  <Step title="Transcription (voice only)">
+    If you recorded audio, the `transcribe` server action converts it to text before passing it to the preview agent.
+  </Step>
+  <Step title="Preview generation">
+    `getPreview` sends the text to `generatePreview`, which calls `gemini-3-flash-preview` with the vibe input and returns a validated `PreviewOutput`.
+  </Step>
+  <Step title="Instant preview display">
+    The UI renders the generated name, tagline, description, and tech stack. You can edit the fields before proceeding.
+  </Step>
+  <Step title="Confirm and create">
+    When you confirm the preview, the values are passed to `createProject`, which triggers the planner agent to build the full task graph.
+  </Step>
+</Steps>
+
+## `generatePreview` internals
+
+The core function is `generatePreview` in `src/lib/ai/preview-agent.ts`:
+
+```typescript
+export async function generatePreview(
+  input: PreviewAgentInput,
+): Promise<PreviewAgentResult> {
+  try {
+    const { output } = await generateText({
+      model: google(PREVIEW_MODEL),
+      output: Output.object({ schema: previewOutputSchema }),
+      system: PREVIEW_SYSTEM_PROMPT,
+      prompt: `Here's the user's project idea:\n\n"${input.vibeInput}"\n\nGenerate a project preview with a name, tagline, description, and recommended tech stack.`,
+      temperature: 0.7,
+    })
+
+    return { success: true, data: output }
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : 'Unknown error occurred'
+    return { success: false, error: message }
+  }
+}
+```
+
+Errors are caught and returned as a typed result union rather than thrown, so the server action can convert them into HTTP errors with a clear message.

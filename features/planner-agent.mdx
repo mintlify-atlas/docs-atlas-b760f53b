@@ -1,0 +1,220 @@
+---
+title: "Planner agent"
+description: "How Dev0 generates a phased, dependency-aware task graph from your project preview using Gemini 3 Pro."
+---
+
+The planner agent transforms a confirmed project preview into a complete, actionable project plan: a spec, a README, and a dependency-ordered task graph that drives the entire execution pipeline.
+
+## What it does
+
+The planner agent acts as a senior technical architect. Given a project name, description, tech stack, and the original vibe input, it produces:
+
+1. **Project specification** — overview, key features, and technical notes
+2. **Task graph** — 5–20 atomic tasks with phases, ordering, dependencies, and model assignments
+3. **README content** — committed directly to the new GitHub repository
+
+## Model
+
+The planner uses `gemini-3-pro-preview`, exported from `src/lib/ai/models.ts` as `GEMINI_3_PRO`.
+
+It runs at `temperature: 0.5` — lower than the preview agent to favor consistent, well-structured plans over creative variation.
+
+## Output schema
+
+### Project spec
+
+`projectSpecSchema` captures the structured spec written into the project:
+
+```typescript
+export const projectSpecSchema = z.object({
+  name: z.string().describe('The project name'),
+  tagline: z.string().describe('Short, punchy tagline'),
+  overview: z
+    .string()
+    .describe(
+      'A comprehensive overview of the project (2-3 paragraphs). Include the problem it solves, target users, and key differentiators',
+    ),
+  features: z
+    .array(z.string())
+    .min(3)
+    .max(8)
+    .describe('Key features of the application (3-8 features)'),
+  technicalNotes: z
+    .string()
+    .optional()
+    .describe('Any technical considerations, constraints, or architectural decisions'),
+})
+```
+
+### Planned task
+
+Each task in the plan conforms to `plannedTaskSchema`:
+
+```typescript
+export const plannedTaskSchema = z.object({
+  id: z
+    .string()
+    .describe(
+      'Stable task ID (e.g., "task-1", "task-2"). Must be unique across the plan',
+    ),
+  title: z
+    .string()
+    .describe('Clear, action-oriented task title (e.g., "Implement user authentication")'),
+  description: z
+    .string()
+    .describe(
+      'Detailed description of what needs to be done, including acceptance criteria',
+    ),
+  phase: z
+    .number()
+    .min(1)
+    .max(5)
+    .describe('Phase number (1-5) - lower phases are foundational, higher phases build on them'),
+  order: z
+    .number()
+    .min(1)
+    .describe('Order within the phase (1-based) - determines execution sequence'),
+  dependencies: z
+    .array(z.string())
+    .describe(
+      'Array of task IDs that this task depends on. Empty if no dependencies',
+    ),
+  complexity: taskComplexitySchema.describe(
+    'Task complexity: low (< 30 min), medium (30-60 min), high (> 60 min)',
+  ),
+  geminiModel: z
+    .enum(['gemini-3-flash-preview', 'gemini-3-pro-preview'])
+    .describe(
+      'Recommended Gemini model for this task. Use flash for straightforward tasks, pro for complex reasoning',
+    ),
+})
+```
+
+### Full planner output
+
+```typescript
+export const plannerOutputSchema = z.object({
+  spec: projectSpecSchema,
+  tasks: z
+    .array(plannedTaskSchema)
+    .min(5)
+    .max(20)
+    .describe(
+      'Atomic, well-ordered tasks (5-20). Each task should be completable in a single PR.',
+    ),
+  readmeContent: z
+    .string()
+    .describe(
+      'Complete README.md content for the project repository.',
+    ),
+})
+```
+
+## Phase guidelines
+
+The planner organizes tasks into up to five phases, each building on the previous:
+
+| Phase | Name | Focus |
+|-------|------|-------|
+| 1 | Foundation | Project setup and core client utilities |
+| 2 | Core Features | Main functionality and key user flows |
+| 3 | Secondary Features | Additional features and integrations |
+| 4 | Polish | Styling, animations, and error handling |
+| 5 | Launch | Testing, documentation, and deployment |
+
+## How dependencies work
+
+Dependencies are specified as arrays of task IDs, not indices. A task will not be executed until all tasks listed in its `dependencies` array have reached `DONE` or `SKIPPED` status.
+
+```json
+{
+  "id": "task-5",
+  "title": "Implement filter sidebar",
+  "phase": 2,
+  "order": 2,
+  "dependencies": ["task-3", "task-4"]
+}
+```
+
+In this example, `task-5` will not become runnable until both `task-3` and `task-4` are complete.
+
+<Warning>
+  A task is also considered blocked if any earlier task in the phase/order sequence is not yet complete — even if its explicit dependency list is empty. Both dependency conditions must be satisfied.
+</Warning>
+
+## Model assignment
+
+The planner assigns a Gemini model to each task based on complexity:
+
+<CardGroup cols={2}>
+  <Card title="gemini-3-flash-preview" icon="bolt">
+    Assigned to **low-complexity** tasks: UI components, simple CRUD, styling, content layout. Faster and cheaper for straightforward implementation work.
+  </Card>
+  <Card title="gemini-3-pro-preview" icon="brain">
+    Assigned to **medium and high-complexity** tasks: auth setup, complex state management, architecture decisions. Deeper reasoning produces better results for non-trivial problems.
+  </Card>
+</CardGroup>
+
+You can override the model assignment for any task from the project dashboard before running it.
+
+## The `createProject` server action
+
+The planner agent is invoked as part of the `createProject` server action in `src/lib/actions/project.ts`. This action orchestrates the full project creation sequence:
+
+<Steps>
+  <Step title="Insert initial project record">
+    A new project row is created in PostgreSQL with status `PLANNING`, storing the name, description, vibe input, tech stack, and theme.
+  </Step>
+  <Step title="Generate the plan">
+    `generateProjectPlan` is called with the project name, description, vibe input, and tech stack. It calls `gemini-3-pro-preview` and returns a validated `PlannerOutput`.
+  </Step>
+  <Step title="Persist the spec">
+    The `spec` from the planner output is serialized to markdown and stored as `specContent` on the project. This spec is later injected into every task prompt at execution time.
+  </Step>
+  <Step title="Create tasks">
+    Tasks from the plan are inserted into the `tasks` table. Planner-assigned IDs (e.g. `task-1`) are replaced with UUIDs; dependency references are remapped accordingly.
+  </Step>
+  <Step title="Create the GitHub repository">
+    `createProjectRepository` initializes a repo under the bot account and commits the README and `TASKLIST.md`.
+  </Step>
+  <Step title="Update project to READY">
+    The project record is updated with the repo URL, repo name, and status `READY`.
+  </Step>
+</Steps>
+
+## Task normalization
+
+Before tasks are inserted into the database, `normalizePlannedTasks` in `src/lib/ai/planner-agent.ts` runs post-processing:
+
+- **ID deduplication** — duplicate or blank IDs are replaced with `task-{index}`
+- **Dependency validation** — dependency references that point to non-existent or out-of-order tasks are dropped
+- **Per-phase ordering** — the `order` field is recalculated as a 1-based counter within each phase
+
+This ensures clean, consistent data regardless of model output variation.
+
+## `generateProjectPlan` internals
+
+The core function is `generateProjectPlan` in `src/lib/ai/planner-agent.ts`:
+
+```typescript
+export async function generateProjectPlan(
+  input: PlannerAgentInput,
+): Promise<PlannerAgentResult> {
+  const { output } = await generateText({
+    model: google(PLANNER_MODEL),
+    output: Output.object({ schema: plannerOutputSchema }),
+    system: PLANNER_SYSTEM_PROMPT,
+    prompt,
+    temperature: 0.5,
+  })
+
+  const normalizedTasks = normalizePlannedTasks(output.tasks)
+
+  return {
+    success: true,
+    data: { ...output, tasks: normalizedTasks },
+  }
+}
+```
+
+The prompt passed to the model includes the project name, description, tech stack label, and the original vibe input, giving the planner all necessary context to generate a coherent plan.

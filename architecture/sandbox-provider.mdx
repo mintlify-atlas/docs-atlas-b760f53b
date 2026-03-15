@@ -1,0 +1,199 @@
+---
+title: "Sandbox Provider"
+description: "How Dev0 provisions and manages E2B sandboxes: the provider abstraction, lifecycle, command execution, and Gemini CLI streaming."
+---
+
+All sandbox operations are routed through a provider abstraction defined in `src/lib/sandbox/provider-interface.ts`. The concrete implementation is the E2B provider at `src/lib/sandbox/providers/e2b.ts`.
+
+## Provider Interface
+
+```typescript
+export type SandboxProvider = {
+  createSandbox(config: CreateSandboxConfig): Promise<SandboxInstance>
+  getOrCreateProjectSandbox(projectId: string, taskId?: string): Promise<SandboxInstance>
+  executeCommand(sandboxId: string, command: string, options?: ExecuteCommandOptions): Promise<CommandResult>
+  executeCommandStreaming(sandboxId: string, command: string, options?: StreamingCommandOptions): Promise<CommandResult>
+  executeGemini(sandboxId: string, options: GeminiExecOptions): Promise<CommandResult>
+  executeGeminiStreaming(sandboxId: string, options: GeminiExecOptions, callbacks?: StreamingCallbacks): Promise<CommandResult>
+  startDevServer(sandboxId: string, command: string): Promise<void>
+  getPreviewUrl(sandboxId: string, port: number): Promise<string>
+  listFiles(sandboxId: string, rootPath: string, options?: { depth?: number }): Promise<SandboxFileEntry[]>
+  readFile(sandboxId: string, path: string): Promise<string>
+  resetProjectSandbox(projectId: string): Promise<SandboxInstance>
+  stopSandbox(sandboxId: string): Promise<void>
+  deleteSandbox(sandboxId: string): Promise<void>
+  getSandbox(sandboxId: string): Promise<SandboxInstance>
+}
+```
+
+<Note>
+  Only `e2bProvider` is registered today. The abstraction exists so the E2B dependency can be swapped for another provider without changing orchestrator code.
+</Note>
+
+## E2B Template
+
+All sandboxes are created from the `dev0-universal` template (configurable via `E2B_TEMPLATE` env var). This template ships with:
+
+- `gemini` CLI pre-installed and on `$PATH`
+- `gh` CLI (GitHub CLI) for PR creation
+- `git` with standard config
+- `bun` package manager
+- Common dev tools (Node.js, Python, etc.)
+
+## Sandbox Lifecycle
+
+### `getOrCreateProjectSandbox`
+
+The orchestrator calls this before every task execution. The lookup strategy is:
+
+```typescript
+async getOrCreateProjectSandbox(
+  projectId: string,
+  taskId?: string,
+): Promise<SandboxInstance>
+```
+
+<Steps>
+  <Step title="Check by taskId">
+    If `taskId` is provided, query `sandboxes` where `task_id = taskId`. If found and still connectable, return it immediately.
+  </Step>
+  <Step title="Check by project">
+    Query `sandboxes` where `project_id = projectId AND status = 'READY'`. If found and still connectable via `Sandbox.connect(sandboxId)`, update `taskId` if needed and return.
+  </Step>
+  <Step title="Mark stale as STOPPED">
+    If `Sandbox.connect()` throws (sandbox timed out or was killed), update the DB record to `STOPPED`.
+  </Step>
+  <Step title="Create new sandbox">
+    Falls through to `createSandbox({ projectId, techStack, taskId })` which provisions a fresh E2B instance and clones the project repo.
+  </Step>
+</Steps>
+
+### `createSandbox`
+
+Provisions a brand-new E2B sandbox:
+
+1. Creates the sandbox with `Sandbox.create(DEFAULT_TEMPLATE, { envs, metadata, allowInternetAccess: true })`
+2. Injects `GITHUB_TOKEN`, `GH_TOKEN`, `GEMINI_API_KEY`, and `AGENT_GEMINI_API_KEY` as environment variables
+3. Writes Gemini CLI auth config to `~/.gemini/settings.json` and `~/.gemini/.env`
+4. Clones the project repo to `~/project` using an authenticated GitHub URL (`x-access-token:{token}@github.com/...`)
+5. Sets the `origin` remote to the authenticated URL
+6. Writes Gemini CLI config to `~/project/.gemini/settings.json`
+7. Persists the sandbox record to the `sandboxes` table with `status = 'READY'`
+
+### Sandbox Reuse Strategy
+
+One sandbox is created per project and reused across sequential task executions. This avoids the overhead of cloning the repository on every task and allows the sandbox to accumulate incremental git state.
+
+Between tasks, `syncRepoToDefaultBranch` ensures the sandbox is always on the latest commit of the default branch before the next task starts.
+
+## `executeCommand`
+
+Runs a shell command synchronously inside the sandbox:
+
+```typescript
+async executeCommand(
+  sandboxId: string,
+  command: string,
+  options?: ExecuteCommandOptions,
+): Promise<CommandResult>
+```
+
+All commands are wrapped in `bash -lc '...'` (login shell) by default, which loads `.bashrc`/`.profile` and ensures `PATH` includes tools like `bun`, `gh`, and `gemini`.
+
+```typescript
+const wrappedCommand =
+  options?.wrapBash === false
+    ? fullCommand
+    : `bash -lc '${escapeForSingleQuotes(fullCommand)}'`
+```
+
+Returns:
+
+```typescript
+type CommandResult = {
+  exitCode: number
+  stdout: string
+  stderr: string
+  duration: number  // milliseconds
+}
+```
+
+## `executeGeminiStreaming`
+
+Runs Gemini CLI with `--output-format stream-json` and forwards real-time output via callbacks:
+
+```typescript
+async executeGeminiStreaming(
+  sandboxId: string,
+  options: GeminiExecOptions,
+  callbacks?: StreamingCallbacks,
+): Promise<CommandResult>
+```
+
+Internally builds the command:
+
+```typescript
+const geminiArgs = [
+  yolo ? '--yolo' : '',
+  `--model ${model}`,
+  '--output-format stream-json',
+  `-p "${escapeForDoubleQuotes(prompt)}"`,
+]
+
+const geminiCmd = [
+  `GEMINI_API_KEY='${escapeForSingleQuotes(env.AGENT_GEMINI_API_KEY)}'`,
+  'unset GOOGLE_CLOUD_PROJECT &&',
+  'unset GOOGLE_CLOUD_PROJECT_ID &&',
+  buildGeminiCommand(geminiArgs),
+].filter(Boolean).join(' ')
+```
+
+`GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_PROJECT_ID` are explicitly unset to prevent the Gemini CLI from attempting ADC (Application Default Credentials) instead of the API key.
+
+The streaming callbacks:
+
+```typescript
+type StreamingCallbacks = {
+  onStdout?: (data: string) => void   // called per chunk of stdout
+  onStderr?: (data: string) => void   // called per chunk of stderr
+  onComplete?: (exitCode: number) => void
+}
+```
+
+The orchestrator's `onStdout` handler buffers chunks until a newline, then parses complete JSONL lines via `isGeminiEvent`.
+
+## Key Types
+
+```typescript
+type GeminiExecOptions = {
+  prompt: string
+  model?: string
+  yolo?: boolean
+  cwd?: string
+  onOutput?: (data: string) => void
+}
+
+type ExecuteCommandOptions = {
+  cwd?: string
+  timeout?: number
+  onOutput?: (data: string) => void
+  wrapBash?: boolean
+}
+
+type SandboxInstance = {
+  id: string        // Dev0 DB record UUID
+  sandboxId: string // E2B sandbox ID string
+  status: 'ready' | 'running' | 'stopped' | 'error'
+  publicUrl?: string
+}
+```
+
+## Configuration
+
+| Environment variable | Description | Default |
+|---|---|---|
+| `E2B_API_KEY` | E2B API key (required) | — |
+| `E2B_TEMPLATE` | Sandbox template name | `dev0-universal` |
+| `E2B_SANDBOX_TIMEOUT_MS` | Sandbox idle timeout | `3600000` (1 hour) |
+| `DEFAULT_COMMAND_TIMEOUT_MS` | Per-command timeout | `600000` (10 min) |
+| `AGENT_GEMINI_API_KEY` | Gemini API key injected into sandboxes | — |

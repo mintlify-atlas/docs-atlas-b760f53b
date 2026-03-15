@@ -1,0 +1,290 @@
+---
+title: "Streaming Events"
+description: "GeminiStreamEvent discriminated union, JSONL parsing from Gemini CLI, Upstash Realtime pub/sub schema, and log persistence."
+---
+
+Dev0 captures every action taken by the Gemini agent as a typed event stream. Events flow from the Gemini CLI running inside the E2B sandbox, through the orchestrator, out to the browser via Upstash Realtime, and are persisted to the `task_logs` table.
+
+## `GeminiStreamEvent` Union
+
+Defined in `src/lib/types/gemini-stream.ts`. Each event shares a `timestamp` base field and is discriminated by `type`:
+
+```typescript
+export type GeminiStreamEvent =
+  | GeminiInitEvent
+  | GeminiMessageEvent
+  | GeminiToolUseEvent
+  | GeminiToolResultEvent
+  | GeminiErrorEvent
+  | GeminiResultEvent
+```
+
+### Event Types
+
+<Tabs>
+  <Tab title="init">
+    Emitted at the start of a Gemini CLI session.
+
+    ```typescript
+    export interface GeminiInitEvent extends GeminiBaseEvent {
+      type: 'init'
+      session_id: string
+      model: string
+    }
+    ```
+
+    | Field | Description |
+    |---|---|
+    | `session_id` | Unique ID for the Gemini CLI session |
+    | `model` | Model identifier used for this run |
+  </Tab>
+  <Tab title="message">
+    User prompts and assistant responses. Streaming (delta) and complete variants.
+
+    ```typescript
+    export interface GeminiMessageEvent extends GeminiBaseEvent {
+      type: 'message'
+      role: 'user' | 'assistant'
+      content: string
+      delta?: boolean  // true = incremental streaming chunk
+    }
+    ```
+
+    | Field | Description |
+    |---|---|
+    | `role` | `'user'` for the injected prompt, `'assistant'` for agent responses |
+    | `content` | Full or partial message text |
+    | `delta` | If `true`, this is an incremental chunk of a streaming response |
+  </Tab>
+  <Tab title="tool_use">
+    Emitted when the agent invokes a tool (file read/write, shell command, etc.).
+
+    ```typescript
+    export interface GeminiToolUseEvent extends GeminiBaseEvent {
+      type: 'tool_use'
+      tool_name: string
+      tool_id: string
+      parameters: Record<string, JsonValue>
+    }
+    ```
+
+    | Field | Description |
+    |---|---|
+    | `tool_name` | Name of the tool invoked (e.g. `read_file`, `run_shell_command`) |
+    | `tool_id` | Unique ID correlating this call with its `tool_result` |
+    | `parameters` | Tool input arguments as a JSON object |
+  </Tab>
+  <Tab title="tool_result">
+    Emitted after a tool call completes, referencing the originating `tool_id`.
+
+    ```typescript
+    export interface GeminiToolResultEvent extends GeminiBaseEvent {
+      type: 'tool_result'
+      tool_id: string
+      status: 'success' | 'error'
+      output?: string
+      error?: string
+    }
+    ```
+
+    | Field | Description |
+    |---|---|
+    | `tool_id` | Matches a previous `tool_use` event's `tool_id` |
+    | `status` | `'success'` or `'error'` |
+    | `output` | Tool stdout / result text. Nullable. |
+    | `error` | Error message if `status === 'error'`. Nullable. |
+  </Tab>
+  <Tab title="error">
+    Non-fatal error event (does not stop execution).
+
+    ```typescript
+    export interface GeminiErrorEvent extends GeminiBaseEvent {
+      type: 'error'
+      message: string
+      code?: string
+    }
+    ```
+  </Tab>
+  <Tab title="result">
+    Final event emitted by Gemini CLI with aggregated execution statistics.
+
+    ```typescript
+    export interface GeminiResultEvent extends GeminiBaseEvent {
+      type: 'result'
+      status: 'success' | 'error'
+      stats: GeminiResultStats
+    }
+
+    export interface GeminiResultStats {
+      total_tokens?: number
+      input_tokens?: number
+      output_tokens?: number
+      duration_ms?: number
+      tool_calls?: number
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Type Guards
+
+```typescript
+// Check if an unknown value is a valid GeminiStreamEvent
+export function isGeminiEvent(value: unknown): value is GeminiStreamEvent {
+  if (typeof value !== 'object' || value === null || !('type' in value)) {
+    return false
+  }
+  const type = (value as { type: unknown }).type
+  return (
+    type === 'init' ||
+    type === 'message' ||
+    type === 'tool_use' ||
+    type === 'tool_result' ||
+    type === 'error' ||
+    type === 'result'
+  )
+}
+
+// Narrow to tool events
+export function isToolEvent(
+  event: GeminiStreamEvent,
+): event is GeminiToolUseEvent | GeminiToolResultEvent {
+  return event.type === 'tool_use' || event.type === 'tool_result'
+}
+
+// Narrow to message events
+export function isMessageEvent(
+  event: GeminiStreamEvent,
+): event is GeminiMessageEvent {
+  return event.type === 'message'
+}
+```
+
+## JSONL Parsing
+
+Gemini CLI writes one JSON object per line to stdout when `--output-format stream-json` is used. The orchestrator buffers chunks until complete lines are available:
+
+```typescript
+let stdoutRemainder = ''
+let stdoutChunks: string[] = []
+
+const handleStdoutLine = (line: string) => {
+  if (!line.trim()) return
+  try {
+    const parsed = JSON.parse(line)
+    const geminiEvent = isGeminiEvent(parsed) ? parsed : undefined
+    // ...
+  } catch {
+    // Non-JSON line: emit as raw log
+  }
+}
+
+// onStdout callback buffers until newline
+onStdout: (chunk) => {
+  stdoutChunks.push(chunk)
+  if (!chunk.includes('\n')) return
+  const combined = stdoutRemainder + stdoutChunks.join('')
+  stdoutChunks = []
+  const lines = combined.split('\n')
+  stdoutRemainder = lines.pop() ?? ''
+  for (const line of lines) {
+    handleStdoutLine(line)
+  }
+},
+// onComplete flushes any remainder
+onComplete: () => {
+  const tail = stdoutRemainder + stdoutChunks.join('')
+  if (tail.trim()) handleStdoutLine(tail.trim())
+},
+```
+
+## Upstash Realtime Schema
+
+Events are published to a per-project channel `execution:{projectId}`. The schema is defined in `src/lib/realtime/schema.ts`:
+
+```typescript
+export const executionEventSchema = {
+  execution: {
+    task_started: z.object({
+      projectId: z.string(),
+      taskId: z.string(),
+      sandboxId: z.string(),
+    }),
+    task_log: z.object({
+      projectId: z.string(),
+      taskId: z.string(),
+      log: z.string(),
+      stream: z.enum(['stdout', 'stderr']),
+      geminiEvent: z.unknown().optional(),
+    }),
+    task_review: z.object({
+      projectId: z.string(),
+      taskId: z.string(),
+      prUrl: z.string().optional(),
+    }),
+    task_failed: z.object({
+      projectId: z.string(),
+      taskId: z.string(),
+      error: z.string(),
+    }),
+  },
+}
+```
+
+### Realtime Event Types
+
+| Event | When emitted | Key payload |
+|---|---|---|
+| `execution.task_started` | Task claimed + sandbox ready | `taskId`, `sandboxId` |
+| `execution.task_log` | Every stdout/stderr line from Gemini CLI | `log`, `stream`, `geminiEvent?` |
+| `execution.task_review` | Task completed successfully, PR opened | `prUrl` |
+| `execution.task_failed` | Task failed or errored | `error` |
+
+### Log Filtering
+
+```typescript
+const shouldEmit =
+  !(geminiEvent?.type === 'message' && geminiEvent.role === 'user')
+if (shouldEmit) {
+  void getRealtimeChannel(projectId).emit('execution.task_log', { ... })
+}
+```
+
+`user` role `message` events (containing the full prompt injected into the agent) are **not** emitted to the browser. All other event types — assistant messages, tool calls, tool results, errors, and the final result — are streamed live.
+
+<Note>
+  User messages are still persisted to `task_logs.events`. They are only excluded from the real-time channel to avoid sending the full prompt text on every log update.
+</Note>
+
+## Log Persistence
+
+All events (including user messages) are collected in memory during execution and upserted to `task_logs` at the end of the run:
+
+```typescript
+const collectedEvents: GeminiStreamEvent[] = []
+
+// inside handleStdoutLine:
+if (geminiEvent) {
+  collectedEvents.push(geminiEvent)
+}
+
+// after execution:
+await persistTaskLogs(task.id, collectedEvents, result.duration)
+```
+
+On error, `persistTaskLogs` is still called with whatever events were collected before the failure, ensuring partial runs are not lost:
+
+```typescript
+if (collectedEvents.length > 0) {
+  await persistTaskLogs(task.id, collectedEvents, 0).catch(() => {})
+}
+```
+
+## Channel Naming
+
+```typescript
+export const getExecutionChannel = (projectId: string) =>
+  `execution:${projectId}`
+```
+
+The browser subscribes to `execution:{projectId}` using the `@upstash/realtime` client SDK and receives all four event types for the current project's active execution.

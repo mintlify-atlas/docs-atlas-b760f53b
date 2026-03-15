@@ -1,0 +1,186 @@
+---
+title: "Docker"
+description: "Build and run Dev0 as a Docker container on any Docker-compatible host."
+---
+
+## Overview
+
+Dev0 ships with a multi-stage Dockerfile that produces a lean production image using Bun as the runtime. The image exposes port `3000` and requires environment variables for all external services.
+
+## Dockerfile
+
+The production image is built in three stages:
+
+```dockerfile
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+# --- Install dependencies ---
+FROM base AS deps
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+# --- Build with Node (Bun has a known memory issue with Vite builds) ---
+FROM node:22-slim AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+RUN npm run build
+
+# --- Production image ---
+FROM base AS production
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=3000
+COPY --from=build /app/.output /app/.output
+COPY --from=build /app/public /app/public
+EXPOSE 3000
+CMD ["bun", "--bun", ".output/server/index.mjs"]
+```
+
+<Note>
+  The build stage intentionally uses `node:22-slim` instead of Bun to work around a known memory issue when running Vite builds with Bun. `NODE_OPTIONS="--max-old-space-size=4096"` is set to give the build process enough heap space.
+</Note>
+
+## Build and Run
+
+<Steps>
+  <Step title="Build the Docker image">
+    From the root of the repository:
+
+    ```bash
+    docker build -t dev0 .
+    ```
+  </Step>
+
+  <Step title="Run the container">
+    Pass all required environment variables via `-e` flags:
+
+    ```bash
+    docker run --rm -p 3000:3000 \
+      -e DATABASE_URL=... \
+      -e E2B_API_KEY=... \
+      -e GOOGLE_GENERATIVE_AI_API_KEY=... \
+      -e AGENT_GEMINI_API_KEY=... \
+      -e GITHUB_TOKEN=... \
+      -e UPSTASH_REDIS_REST_URL=... \
+      -e UPSTASH_REDIS_REST_TOKEN=... \
+      dev0
+    ```
+
+    The app will be available at [http://localhost:3000](http://localhost:3000).
+  </Step>
+</Steps>
+
+## Environment Variable Reference
+
+All environment variables must be supplied at runtime. There are no defaults for secrets.
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | Yes | PostgreSQL connection string, e.g. `postgresql://user:pass@host:5432/dev0` |
+| `E2B_API_KEY` | Yes | API key for E2B sandbox orchestration |
+| `E2B_TEMPLATE` | No | Sandbox template name (defaults to `dev0-universal`) |
+| `E2B_SANDBOX_TIMEOUT_MS` | No | Sandbox timeout in milliseconds (default `3600000`) |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Yes | Gemini API key used by the planning and preview agents |
+| `AGENT_GEMINI_API_KEY` | Yes | Gemini API key injected into sandbox environments for autonomous execution |
+| `GITHUB_TOKEN` | Yes | GitHub personal access token for a bot account |
+| `GITHUB_BOT_USERNAME` | No | Username for the GitHub bot (default `dev0-agent`) |
+| `UPSTASH_REDIS_REST_URL` | Yes | Upstash Redis REST URL for real-time pub/sub |
+| `UPSTASH_REDIS_REST_TOKEN` | Yes | Upstash Redis REST token |
+| `APP_URL` | No | Public URL of the running app (used for callbacks) |
+
+## Docker Run vs Docker Compose
+
+<CodeGroup>
+
+```bash docker run
+docker run --rm -p 3000:3000 \
+  -e DATABASE_URL=postgresql://user:password@your-db-host:5432/dev0 \
+  -e E2B_API_KEY=your_e2b_api_key \
+  -e GOOGLE_GENERATIVE_AI_API_KEY=your_gemini_key \
+  -e AGENT_GEMINI_API_KEY=your_agent_gemini_key \
+  -e GITHUB_TOKEN=your_github_token \
+  -e UPSTASH_REDIS_REST_URL=https://your-upstash-url \
+  -e UPSTASH_REDIS_REST_TOKEN=your_upstash_token \
+  dev0
+```
+
+```yaml docker-compose.yml
+services:
+  app:
+    build: .
+    image: dev0
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://dev0:dev0password@db:5432/dev0
+      E2B_API_KEY: ${E2B_API_KEY}
+      E2B_TEMPLATE: dev0-universal
+      E2B_SANDBOX_TIMEOUT_MS: "3600000"
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY}
+      AGENT_GEMINI_API_KEY: ${AGENT_GEMINI_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_BOT_USERNAME: dev0-agent
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
+      APP_URL: http://localhost:3000
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dev0
+      POSTGRES_PASSWORD: dev0password
+      POSTGRES_DB: dev0
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev0"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+```
+
+</CodeGroup>
+
+<Tip>
+  When using Docker Compose, store sensitive values (API keys, tokens) in a `.env` file at the project root. Docker Compose automatically loads it, keeping secrets out of your `docker-compose.yml`.
+</Tip>
+
+## Health Check Considerations
+
+The production image does not define a `HEALTHCHECK` instruction by default. When running on an orchestrated platform (Kubernetes, ECS, Cloud Run), configure liveness and readiness probes against `GET /` or a dedicated health endpoint.
+
+For Docker Compose, add a health check to the `app` service:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "curl -f http://localhost:3000 || exit 1"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 20s
+```
+
+## Volume Mounts
+
+Dev0 itself is stateless — all persistent state lives in PostgreSQL and Upstash Redis. No application-level volumes are required.
+
+If you are running the bundled PostgreSQL service via Docker Compose, mount a named volume for the database data directory:
+
+```yaml
+volumes:
+  - postgres_data:/var/lib/postgresql/data
+```
+
+This ensures your database survives container restarts.

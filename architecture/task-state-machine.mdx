@@ -1,0 +1,179 @@
+---
+title: "Task State Machine"
+description: "How tasks move through states from PENDING to DONE, retry logic, dependency resolution, and project lifecycle."
+---
+
+Every task in Dev0 has a `status` column that follows a strict state machine. The orchestrator enforces transitions; no code path sets a status arbitrarily.
+
+## Task States
+
+<CardGroup cols={3}>
+  <Card title="PENDING" icon="clock">
+    Initial state after planning. The task is waiting to be claimed by the orchestrator.
+  </Card>
+  <Card title="RUNNING" icon="play">
+    Claimed by the orchestrator. A sandbox is active and Gemini CLI is executing inside it.
+  </Card>
+  <Card title="REVIEW" icon="eye">
+    Execution succeeded. A PR has been opened on GitHub. Waiting for human review.
+  </Card>
+  <Card title="DONE" icon="check">
+    PR merged. Task is complete and counts as satisfied for dependency resolution.
+  </Card>
+  <Card title="FAILED" icon="x">
+    Execution failed (non-zero exit code, sandbox error, or git/PR failure). Attempts counter incremented. Can be retried.
+  </Card>
+  <Card title="SKIPPED" icon="forward">
+    Explicitly skipped. Treated as complete for dependency resolution — dependent tasks can proceed.
+  </Card>
+</CardGroup>
+
+## State Transition Diagram
+
+```
+                    ┌─────────┐
+          planning  │ PENDING │ ◄──────────────────┐
+          complete  └────┬────┘                    │
+                         │ orchestrator claims       │
+                         ▼                          │ retry (attempts < maxAttempts)
+                    ┌─────────┐                    │
+                    │ RUNNING │ ───────────────────►│
+                    └────┬────┘                    │
+             ┌───────────┴────────────┐             │
+        exit=0 + PR               exit≠0 /         │
+        created                   sandbox error     │
+             │                        │             │
+             ▼                        ▼             │
+        ┌────────┐              ┌────────┐          │
+        │ REVIEW │              │ FAILED ├──────────┘
+        └────┬───┘              └────────┘
+             │ PR merged                  attempts ≥ maxAttempts →
+             ▼                            task stays FAILED
+         ┌──────┐
+         │ DONE │
+         └──────┘
+
+  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+  PENDING ──► SKIPPED  (manual skip)
+```
+
+## Transition Triggers
+
+| Transition | Triggered by |
+|---|---|
+| Created → `PENDING` | Planner agent writes task rows |
+| `PENDING` → `RUNNING` | `claimPendingTask()` in orchestrator (atomic DB update) |
+| `RUNNING` → `REVIEW` | `completeTask()` with `success: true` after `gh pr create` succeeds |
+| `RUNNING` → `FAILED` | `completeTask()` with `success: false` (any error path) |
+| `FAILED` → `PENDING` | User triggers a retry; task status reset to `PENDING`, attempts already incremented |
+| `REVIEW` → `DONE` | User merges PR (webhook or manual update) |
+| Any → `SKIPPED` | User explicitly skips from the UI |
+
+## Atomic Task Claiming
+
+To prevent two server instances from claiming the same task simultaneously, the orchestrator uses a conditional `UPDATE`:
+
+```typescript
+async function claimPendingTask(taskId: string): Promise<boolean> {
+  const updated = await db
+    .update(tasks)
+    .set({ status: 'RUNNING' })
+    .where(and(eq(tasks.id, taskId), eq(tasks.status, 'PENDING')))
+    .returning()
+
+  return Boolean(updated[0])
+}
+```
+
+The `WHERE status = 'PENDING'` condition acts as an optimistic lock: if another process already moved the task to `RUNNING`, the update returns no rows and `claimPendingTask` returns `false`. The orchestrator retries up to `MAX_TASK_CLAIM_ATTEMPTS` (3) times before giving up.
+
+## Retry Logic
+
+<Steps>
+  <Step title="Task fails">
+    `completeTask()` sets `status = 'FAILED'` and increments `attempts` via `sql\`${tasks.attempts} + 1\``.
+  </Step>
+  <Step title="Check attempts">
+    The orchestrator (or UI) compares `attempts` against `maxAttempts` (default `3`). If `attempts < maxAttempts`, the task is eligible for retry.
+  </Step>
+  <Step title="Reset to PENDING">
+    A retry action resets `status` back to `PENDING` without touching the `attempts` counter. The next `startTask()` call will pick it up.
+  </Step>
+  <Step title="Permanent failure">
+    Once `attempts >= maxAttempts`, the task remains `FAILED` and is skipped during `getNextRunnableTask` dependency resolution.
+  </Step>
+</Steps>
+
+<Warning>
+  Dependent tasks are blocked while their dependency is `FAILED`. Retry the failed task or manually `SKIP` it to unblock the dependent tasks.
+</Warning>
+
+## Dependency Resolution
+
+The `getNextRunnableTask` function determines which task to run next:
+
+```typescript
+export async function getNextRunnableTask(
+  projectId: string,
+): Promise<Task | null> {
+  const allTasks = await db
+    .select()
+    .from(tasks)
+    .where(eq(tasks.projectId, projectId))
+    .orderBy(asc(tasks.phase), asc(tasks.order))
+
+  const statusById = new Map(allTasks.map((task) => [task.id, task.status]))
+
+  const isComplete = (status: Task['status'] | undefined) =>
+    status === 'DONE' || status === 'SKIPPED'
+
+  let hasPriorIncomplete = false
+  const runnable = allTasks.find((task) => {
+    if (task.status !== 'PENDING') {
+      if (!isComplete(task.status)) {
+        hasPriorIncomplete = true
+      }
+      return false
+    }
+
+    if (hasPriorIncomplete) return false
+
+    const hasUnmetDependencies = !task.dependencies.every((dependencyId) =>
+      isComplete(statusById.get(dependencyId)),
+    )
+
+    if (hasUnmetDependencies) {
+      hasPriorIncomplete = true
+      return false
+    }
+
+    return true
+  })
+
+  return runnable ?? null
+}
+```
+
+The algorithm walks tasks sorted by `(phase, order)` and applies two blocking conditions:
+
+1. **`hasPriorIncomplete`** — if any earlier task is not `DONE` or `SKIPPED`, all subsequent `PENDING` tasks are blocked. This enforces sequential phase progression.
+2. **`dependencies` check** — each `PENDING` task's dependency array is verified: all referenced task IDs must be `DONE` or `SKIPPED`.
+
+<Note>
+  `SKIPPED` counts as complete for dependency purposes. Skipping a blocking task unblocks the rest of the queue.
+</Note>
+
+## Project Status Progression
+
+```
+PLANNING → READY → ACTIVE → PAUSED → COMPLETED → ARCHIVED
+```
+
+| Status | Meaning |
+|---|---|
+| `PLANNING` | Spec and tasks are being generated |
+| `READY` | Tasks planned, waiting for first execution |
+| `ACTIVE` | At least one task is running or has run |
+| `PAUSED` | Execution intentionally paused by the user |
+| `COMPLETED` | All tasks are `DONE` or `SKIPPED` |
+| `ARCHIVED` | Project soft-archived; no further execution |

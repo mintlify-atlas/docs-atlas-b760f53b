@@ -1,0 +1,158 @@
+---
+title: "Environment Variables"
+description: "Complete reference for all environment variables used by Dev0, with descriptions, required status, and example values."
+---
+
+Dev0 is configured entirely through environment variables. Copy `.env.example` to `.env.local` and fill in the values before starting the application.
+
+<Warning>
+  Never commit `.env.local` to version control. It contains secrets such as API keys and database credentials.
+</Warning>
+
+## Database
+
+<ParamField path="DATABASE_URL" type="string" required>
+  PostgreSQL connection string used by Drizzle ORM to connect to the database. Supports any standard PostgreSQL URL, including Neon serverless connections.
+
+  **Example:** `postgresql://user:password@localhost:5432/dev0`
+</ParamField>
+
+## E2B Sandbox
+
+<ParamField path="E2B_API_KEY" type="string" required>
+  API key for the [E2B](https://e2b.dev) sandbox service. Required to create and manage isolated coding environments. Obtain this from your E2B dashboard.
+
+  **Example:** `e2b_...`
+</ParamField>
+
+<ParamField path="E2B_TEMPLATE" type="string">
+  The E2B sandbox template name (or template ID) to use when spawning new sandboxes. Defaults to `dev0-universal`, which is the custom template built and published by this project.
+
+  **Default:** `dev0-universal`  
+  **Example:** `dev0-universal`
+</ParamField>
+
+<ParamField path="E2B_SANDBOX_TIMEOUT_MS" type="string">
+  Maximum lifetime of a sandbox in milliseconds before E2B automatically terminates it. Defaults to 3 600 000 ms (1 hour). Increase this value for long-running tasks.
+
+  **Default:** `3600000`  
+  **Example:** `3600000`
+</ParamField>
+
+## Google Gemini
+
+<ParamField path="GOOGLE_GENERATIVE_AI_API_KEY" type="string" required>
+  Gemini API key used by the **server-side backend** via the Vercel AI SDK (`@ai-sdk/google`). This key powers project planning, spec generation, and task breakdown — it never leaves your server.
+
+  **Example:** `AIza...`
+</ParamField>
+
+<ParamField path="AGENT_GEMINI_API_KEY" type="string" required>
+  A separate Gemini API key that is **injected into E2B sandboxes** at runtime so the Gemini CLI agent can run in `--yolo` (autonomous) mode inside the sandbox. Keep this key separate from your server key so you can revoke or rate-limit it independently.
+
+  **Example:** `AIza...`
+</ParamField>
+
+<ParamField path="GEMINI_MODEL" type="string">
+  Selects the default Gemini model used inside sandboxes. Supported values are `gemini-3-flash-preview` and `gemini-3-pro-preview`.
+
+  **Default:** `gemini-3-pro-preview`  
+  **Example:** `gemini-3-pro-preview`
+</ParamField>
+
+## GitHub
+
+<ParamField path="GITHUB_TOKEN" type="string" required>
+  A GitHub personal access token (classic) or fine-grained token for the bot account that Dev0 uses to create repositories, push branches, and open pull requests. Required scopes: `repo`, `workflow`.
+
+  **Example:** `ghp_...`
+</ParamField>
+
+<ParamField path="GITHUB_BOT_USERNAME" type="string">
+  The GitHub username of the bot account associated with `GITHUB_TOKEN`. Dev0 uses this as the repository owner when creating repos and resolving PR URLs.
+
+  **Default:** `dev0-agent`  
+  **Example:** `dev0-agent`
+</ParamField>
+
+## Application
+
+<ParamField path="APP_URL" type="string">
+  The public base URL of the Dev0 application. Used for generating absolute links (e.g., in webhook callbacks or emails).
+
+  **Default:** `http://localhost:3000`  
+  **Example:** `https://dev0.example.com`
+</ParamField>
+
+<ParamField path="NODE_ENV" type="string">
+  The runtime environment. Controls whether the app runs in development or production mode. Affects logging verbosity and error reporting.
+
+  **Default:** `development`  
+  **Accepted values:** `development`, `production`
+</ParamField>
+
+## Upstash Redis
+
+<ParamField path="UPSTASH_REDIS_REST_URL" type="string" required>
+  The REST endpoint URL for your Upstash Redis database. Used by `@upstash/realtime` to stream live task-execution events to the browser.
+
+  **Example:** `https://us1-xxxx.upstash.io`
+</ParamField>
+
+<ParamField path="UPSTASH_REDIS_REST_TOKEN" type="string" required>
+  The REST API token for your Upstash Redis database. Authenticates server-side writes and client-side reads for the real-time event stream.
+
+  **Example:** `AXxx...`
+</ParamField>
+
+## Test overrides
+
+<ParamField path="TEST_REPO_URL" type="string">
+  A GitHub repository URL used by the sandbox integration tests (`tests/sandbox.test.ts`) instead of creating a new repo on every run. Only needed during development and CI testing.
+
+  **Example:** `https://github.com/dev0-agent/scholarspend-ml2kz1df`
+</ParamField>
+
+---
+
+## Complete `.env.local` example
+
+Copy this block into `.env.local` and replace every placeholder with real values.
+
+```bash
+# ============================================
+# dev0 Environment Configuration
+# ============================================
+
+# Database (PostgreSQL)
+DATABASE_URL="postgresql://user:password@localhost:5432/dev0"
+
+# E2B Sandbox Orchestration
+E2B_API_KEY=""
+E2B_TEMPLATE="dev0-universal"
+E2B_SANDBOX_TIMEOUT_MS="3600000"
+
+# Google Gemini (via Vercel AI SDK — server-side)
+GOOGLE_GENERATIVE_AI_API_KEY=""
+
+# Agent Gemini API Key (injected into sandboxes for autonomous coding)
+AGENT_GEMINI_API_KEY=""
+
+# Gemini model used inside sandboxes
+GEMINI_MODEL="gemini-3-pro-preview"
+
+# GitHub Bot Account
+GITHUB_TOKEN=""
+GITHUB_BOT_USERNAME="dev0-agent"
+
+# Application
+APP_URL="http://localhost:3000"
+NODE_ENV="development"
+
+# Upstash Realtime (Redis)
+UPSTASH_REDIS_REST_URL=""
+UPSTASH_REDIS_REST_TOKEN=""
+
+# Sandbox test overrides (optional — only for integration tests)
+TEST_REPO_URL="https://github.com/dev0-agent/scholarspend-ml2kz1df"
+```

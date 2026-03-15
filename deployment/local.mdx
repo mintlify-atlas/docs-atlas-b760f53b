@@ -1,0 +1,162 @@
+---
+title: "Local Development"
+description: "Run Dev0 on your local machine for development or production builds."
+---
+
+## Prerequisites
+
+Before you begin, make sure you have the following installed and available:
+
+- **[Bun](https://bun.sh/)** — the JavaScript runtime and package manager used by Dev0
+- **PostgreSQL** — running locally (e.g. via Homebrew, Docker, or a managed service)
+- **E2B API key** — for sandbox orchestration ([e2b.dev](https://e2b.dev))
+- **Google Gemini API key** — for planning and execution agents
+- **Upstash Redis credentials** — for real-time pub/sub streaming ([upstash.com](https://upstash.com))
+- **GitHub token** — a bot account token for repo creation and PR operations
+
+## Local Development Setup
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/manasseh-zw/dev0.git
+    cd dev0
+    ```
+  </Step>
+
+  <Step title="Install dependencies">
+    ```bash
+    bun install
+    ```
+  </Step>
+
+  <Step title="Configure environment variables">
+    Copy the example environment file and fill in your values:
+
+    ```bash
+    cp .env.example .env.local
+    ```
+
+    Open `.env.local` and set all required variables:
+
+    ```bash
+    # Database (PostgreSQL)
+    DATABASE_URL="postgresql://user:password@localhost:5432/dev0"
+
+    # E2B Sandbox Orchestration
+    E2B_API_KEY=""
+    E2B_TEMPLATE="dev0-universal"
+    E2B_SANDBOX_TIMEOUT_MS="3600000"
+
+    # Google Gemini (via Vercel AI SDK)
+    GOOGLE_GENERATIVE_AI_API_KEY=""
+
+    # Agent Gemini API Key (injected into sandboxes for YOLO mode)
+    AGENT_GEMINI_API_KEY=""
+
+    # GitHub Bot Account (for repo creation & PR operations)
+    GITHUB_TOKEN=""
+    GITHUB_BOT_USERNAME="dev0-agent"
+
+    # Application
+    APP_URL="http://localhost:3000"
+    NODE_ENV="development"
+
+    # Upstash Realtime (Redis)
+    UPSTASH_REDIS_REST_URL=""
+    UPSTASH_REDIS_REST_TOKEN=""
+    ```
+
+    <Note>
+      `AGENT_GEMINI_API_KEY` is a separate key that gets injected into E2B sandbox environments for autonomous coding. It can be the same as `GOOGLE_GENERATIVE_AI_API_KEY` but is kept separate to allow scoping and rotation.
+    </Note>
+  </Step>
+
+  <Step title="Run database migrations">
+    Apply all Drizzle ORM migrations to your PostgreSQL database:
+
+    ```bash
+    bun run db:migrate
+    ```
+  </Step>
+
+  <Step title="Start the development server">
+    ```bash
+    bun run dev
+    ```
+
+    The app will be available at [http://localhost:3000](http://localhost:3000). The dev server uses Vite with HMR enabled.
+  </Step>
+</Steps>
+
+## Local Production Build
+
+To build and run Dev0 in production mode locally:
+
+<Steps>
+  <Step title="Build the application">
+    ```bash
+    bun run build
+    ```
+
+    This runs `vite build` and outputs the server bundle to `.output/server/index.mjs`.
+
+    <Info>
+      The Dockerfile uses `node:22-slim` for the build step to work around a known memory issue with Bun + Vite builds. When building locally with Bun, you may need to set `NODE_OPTIONS="--max-old-space-size=4096"` if you hit memory limits.
+    </Info>
+  </Step>
+
+  <Step title="Start the production server">
+    ```bash
+    bun run start
+    ```
+
+    This runs `bun --bun .output/server/index.mjs` and serves the built application.
+  </Step>
+</Steps>
+
+## Running Tests
+
+### Unit and Integration Tests
+
+Run the full test suite with Vitest:
+
+```bash
+bun run test
+```
+
+This executes `vitest run` across all test files.
+
+### Sandbox Tests
+
+To run tests that exercise the E2B sandbox integration:
+
+```bash
+bun run test:sandbox
+```
+
+This runs `vitest run tests/sandbox.test.ts`.
+
+<Warning>
+  Sandbox tests spin up real E2B sandbox environments and will consume your E2B API quota. Make sure `E2B_API_KEY` and `AGENT_GEMINI_API_KEY` are set in your `.env.local` before running these tests. You can also set `TEST_REPO_URL` to point at a specific repository for sandbox test runs.
+</Warning>
+
+### GitHub Integration Tests
+
+To run tests for GitHub operations:
+
+```bash
+bun run test:github
+```
+
+This runs `vitest run tests/github.test.ts` and requires a valid `GITHUB_TOKEN`.
+
+## Database Scripts Reference
+
+Dev0 uses Drizzle ORM. The following database scripts are available:
+
+| Script | Command | Description |
+|---|---|---|
+| `db:migrate` | `bunx drizzle-kit migrate` | Apply pending migrations |
+| `db:generate` | `bunx drizzle-kit generate` | Generate new migration files from schema changes |
+| `db:push` | `bunx drizzle-kit push` | Push schema directly (no migration files) |

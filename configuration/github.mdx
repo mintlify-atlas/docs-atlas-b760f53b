@@ -1,0 +1,128 @@
+---
+title: "GitHub"
+description: "How Dev0 uses a dedicated GitHub bot account to create repositories, push branches, and open pull requests for each coding task."
+---
+
+Dev0 interacts with GitHub on your behalf to create a repository for each project and open a pull request for every task the agent completes. This is powered by two environment variables: a personal access token (`GITHUB_TOKEN`) and the matching bot username (`GITHUB_BOT_USERNAME`).
+
+## Why a dedicated bot account?
+
+Using a dedicated bot account (rather than your personal GitHub account) is strongly recommended for several reasons:
+
+- **Clear attribution** — pull requests and commits are clearly authored by the bot, not a human developer.
+- **Scope isolation** — you can grant the bot only the permissions it needs and revoke access without affecting your personal account.
+- **Rate limit separation** — the bot's API rate limits are independent of yours, so heavy agent activity doesn't block your normal GitHub usage.
+
+<Info>
+  You can use your personal account for local testing, but for any shared or production deployment a separate bot account keeps things clean.
+</Info>
+
+## Required environment variables
+
+<ParamField path="GITHUB_TOKEN" type="string" required>
+  A GitHub personal access token (classic) for the bot account. Dev0 uses this token to authenticate all GitHub API calls via Octokit and also passes it to the E2B sandbox so the Gemini CLI agent can push branches.
+
+  **Required scopes:** `repo` (full), `workflow`
+</ParamField>
+
+<ParamField path="GITHUB_BOT_USERNAME" type="string">
+  The GitHub username of the account that owns `GITHUB_TOKEN`. Dev0 uses this as the repository owner when creating repos and constructing clone URLs.
+
+  **Default:** `dev0-agent`
+</ParamField>
+
+## Setting up the bot account
+
+<Steps>
+  <Step title="Create a GitHub account for the bot">
+    Go to [github.com/join](https://github.com/join) and create a new account, for example `your-org-dev0-bot`. Use a shared team email or a dedicated alias so the account isn't tied to a single person.
+  </Step>
+
+  <Step title="Create the template repositories">
+    Dev0 creates new project repos by cloning one of your bot account's template repositories. Fork or create the following template repos under the bot account:
+
+    | Template key | Repository name |
+    |---|---|
+    | `react-vite` | `react-vite-template` |
+    | `nextjs` | `nextjs-template` |
+    | `tanstack-start` | `tanstack-template` |
+
+    Mark each repository as a **GitHub template repository** (Settings → check "Template repository").
+  </Step>
+
+  <Step title="Generate a personal access token">
+    Under the bot account, go to **Settings → Developer settings → Personal access tokens → Tokens (classic)** and generate a new token with these scopes:
+
+    - `repo` — full repository access (create, read, write, delete)
+    - `workflow` — update GitHub Actions workflow files
+
+    Copy the token — you won't be able to see it again.
+  </Step>
+
+  <Step title="Add the token to your environment">
+    Set the token and username in `.env.local`:
+
+    ```bash
+    GITHUB_TOKEN="ghp_..."
+    GITHUB_BOT_USERNAME="your-org-dev0-bot"
+    ```
+  </Step>
+</Steps>
+
+## What Dev0 does with GitHub
+
+### Repository creation
+
+When a project is created, Dev0 calls `createProjectRepository` which:
+
+1. Sanitizes the project name into a GitHub-compatible slug and appends a short random ID (e.g., `my-app-k3f9ab12`).
+2. Calls the GitHub API (`repos.createUsingTemplate`) to create a new repo from the appropriate tech-stack template under the bot account.
+3. Pushes initial files via the Git Trees API:
+   - `README.md` — project overview
+   - `TASKLIST.md` — auto-generated list of all tasks
+   - `LEARNINGS.md` — template for the agent to record learnings
+   - `.dev0/RULES.md` — tech-stack-specific coding rules injected into the agent's context
+
+### Branch strategy
+
+For every task, the agent checks out a dedicated branch named:
+
+```
+dev0/task-{taskId}
+```
+
+This branch is pushed to the bot account's repository and is the base for the pull request.
+
+### Pull request lifecycle
+
+After the agent completes a task, Dev0:
+
+1. Opens a pull request via `gh pr create` (running inside the E2B sandbox) targeting the default branch (`master`).
+2. Stores the PR URL and PR number on the `tasks` record in the database.
+3. Exposes the PR data in the review UI by reading it back through Octokit (`pulls.get`, `pulls.listFiles`, `pulls.listReviewComments`).
+
+### Merging pull requests
+
+Dev0 can merge approved pull requests using the Octokit `pulls.merge` API with the default merge method `squash`.
+
+## Token security
+
+<Warning>
+  Never commit `GITHUB_TOKEN` to version control. Treat it with the same care as a password.
+</Warning>
+
+Dev0 handles the token carefully:
+
+- It is read at runtime from the environment via `src/lib/env.ts` and never hard-coded.
+- When injected into the E2B sandbox as part of the Git clone URL, any error messages that might contain the token are automatically redacted before logging.
+- Inside the sandbox, the token is available as both `GITHUB_TOKEN` and `GH_TOKEN` environment variables so both `git` and the `gh` CLI can authenticate without interactive prompts.
+
+```typescript
+// src/lib/sandbox/providers/e2b.ts
+const envVars = {
+  GITHUB_TOKEN: env.GITHUB_TOKEN,
+  GH_TOKEN: env.GITHUB_TOKEN,
+  GEMINI_API_KEY: env.AGENT_GEMINI_API_KEY,
+  AGENT_GEMINI_API_KEY: env.AGENT_GEMINI_API_KEY,
+}
+```

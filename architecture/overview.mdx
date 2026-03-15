@@ -1,0 +1,136 @@
+---
+title: "Architecture Overview"
+description: "High-level architecture of Dev0: how Frontend, Backend, AI, Sandbox, and GitHub work together to ship pull requests."
+---
+
+Dev0 is built as a pipeline: a product idea flows through a planning layer, gets broken into tasks, each task executes inside an isolated sandbox with a Gemini agent, and every completed task surfaces as a GitHub pull request ready for human review.
+
+## System Components
+
+<CardGroup cols={2}>
+  <Card title="Frontend" icon="browser">
+    **TanStack Start** (React 19 + TanStack Router) served by Vite. Renders the mission control UI — project board, live task logs, diff viewer, and review actions.
+  </Card>
+  <Card title="Backend" icon="server">
+    **TanStack Start server actions** backed by **Drizzle ORM + PostgreSQL**. All mutation logic (planning, task claiming, status updates) runs as typed server functions with no separate API layer.
+  </Card>
+  <Card title="AI Layer" icon="sparkles">
+    **Vercel AI SDK** with **Gemini 3 Flash** (preview/planning) and **Gemini 3 Pro** (task execution). Flash handles fast idea-to-spec transforms; Pro drives full coding agent runs.
+  </Card>
+  <Card title="Sandbox" icon="box">
+    **E2B** cloud sandboxes running the `dev0-universal` template. Each sandbox has the project repo cloned and **Gemini CLI** pre-installed for autonomous YOLO-mode execution.
+  </Card>
+  <Card title="Realtime" icon="bolt">
+    **Upstash Realtime** pub/sub channels stream live events — task start, JSONL log lines, review notifications, and failure alerts — from the server directly to the browser.
+  </Card>
+  <Card title="Git & GitHub" icon="github">
+    **octokit** (server-side repo management) plus **`gh` CLI inside sandboxes** for branch push and PR creation. Every task lands as a `dev0/task-{id}` branch with an open pull request.
+  </Card>
+</CardGroup>
+
+## Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Browser (TanStack Start / React 19)                        │
+│  ┌─────────────┐   ┌──────────────────────────────────────┐ │
+│  │  Project UI  │   │  Live Log Viewer (Upstash Realtime)  │ │
+│  └──────┬──────┘   └──────────────────────────────────────┘ │
+└─────────┼───────────────────────────────────────────────────┘
+          │ server actions
+┌─────────▼───────────────────────────────────────────────────┐
+│  Server (TanStack Start Server Actions)                     │
+│  ┌───────────────┐   ┌──────────────────────────────────┐   │
+│  │  Orchestrator  │   │  Drizzle ORM → PostgreSQL        │   │
+│  │  (task loop)   │   │  projects / tasks / sandboxes /  │   │
+│  │               │   │  task_logs                       │   │
+│  └───────┬───────┘   └──────────────────────────────────┘   │
+└──────────┼──────────────────────────────────────────────────┘
+           │ provision + execute
+┌──────────▼──────────────────────────────────────────────────┐
+│  E2B Sandbox (dev0-universal template)                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  ~/project  ←  cloned GitHub repo                    │   │
+│  │  gemini --yolo --output-format stream-json -p ...    │   │
+│  │     │                                                │   │
+│  │     ├── JSONL events → Upstash Realtime              │   │
+│  │     └── agent-result.json → git commit + gh pr create│   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+           │ PR opened
+┌──────────▼───────────────┐
+│  GitHub Repository       │
+│  branch: dev0/task-{id}  │
+│  PR: ready for review    │
+└──────────────────────────┘
+```
+
+## End-to-End Request Flow
+
+<Steps>
+  <Step title="Idea input">
+    The user enters a product idea ("vibe input"). Gemini 3 Flash generates a project name, tagline, and spec. The project record is created with status `PLANNING`.
+  </Step>
+  <Step title="Task planning">
+    Gemini 3 Pro decomposes the spec into a dependency-aware task graph. Each task gets a phase, order, and model assignment (`gemini-3-flash-preview` or `gemini-3-pro-preview`). Project moves to `READY`.
+  </Step>
+  <Step title="Orchestration starts">
+    `startTask(projectId)` is called. The orchestrator claims the next runnable task (checking dependency completion), provisions an E2B sandbox, and fires `execution.task_started` on the Upstash Realtime channel.
+  </Step>
+  <Step title="Agent execution">
+    Gemini CLI runs inside the sandbox with `--yolo --output-format stream-json`. Each JSONL line is parsed into a typed `GeminiStreamEvent`, persisted to `task_logs`, and streamed to the browser via `execution.task_log`.
+  </Step>
+  <Step title="Git automation">
+    After a successful run, the orchestrator: sets an authenticated remote, creates `dev0/task-{id}` branch, rebases on the default branch, commits, pushes, and opens a pull request with `gh pr create`.
+  </Step>
+  <Step title="Human review">
+    Task status becomes `REVIEW`. The PR URL is stored in the database. Engineers review, approve, and merge from the Dev0 mission control UI or directly on GitHub.
+  </Step>
+</Steps>
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend framework | TanStack Start (React 19) |
+| Routing | TanStack Router (file-based) |
+| Build tool | Vite |
+| UI components | shadcn/ui + Tailwind CSS |
+| Server actions | TanStack Start server functions |
+| ORM | Drizzle ORM |
+| Database | PostgreSQL (Supabase) |
+| AI SDK | Vercel AI SDK |
+| Planning model | Gemini 3 Pro (`gemini-3-pro-preview`) |
+| Execution model | Gemini 3 Flash (`gemini-3-flash-preview`) |
+| Agent runtime | Gemini CLI (`--yolo --output-format stream-json`) |
+| Sandbox | E2B (`dev0-universal` template) |
+| Realtime | Upstash Realtime + Upstash Redis |
+| GitHub API | octokit + `gh` CLI |
+| Package manager | Bun |
+| Language | TypeScript |
+
+## Key Design Decisions
+
+<Accordion title="Why E2B sandboxes?">
+  Each task runs in a fully isolated cloud environment with its own filesystem, network, and process space. This provides:
+  - **Security**: the agent cannot access host resources or other projects
+  - **Reproducibility**: a fresh clone of the project repo for every new sandbox
+  - **Cleanup**: sandboxes are killed or paused after use, no state leaks between tasks
+  - **Tooling**: the `dev0-universal` E2B template ships with Gemini CLI, `gh`, `bun`, and common dev tools pre-installed
+</Accordion>
+
+<Accordion title="Why Gemini CLI in YOLO mode?">
+  `gemini --yolo` runs the CLI in non-interactive autonomous mode: the agent executes tool calls (file read/write, shell commands) without confirmation prompts. Combined with `--output-format stream-json`, every agent action is emitted as a typed JSONL event, giving Dev0 full observability into what the agent is doing in real time. YOLO mode is safe here because the agent is already contained inside an E2B sandbox.
+</Accordion>
+
+<Accordion title="Why PR-first?">
+  Every completed task opens a pull request on GitHub before being marked `REVIEW`. This means:
+  - All agent changes are auditable via standard GitHub diffs
+  - Engineers are in the loop as the final approval gate
+  - Failed or unwanted changes can be closed without ever touching production
+  - The PR history serves as a permanent record of what each agent did and why
+</Accordion>
+
+<Accordion title="Why two separate Gemini API keys?">
+  `GOOGLE_GENERATIVE_AI_API_KEY` is used by the backend (Vercel AI SDK) for planning and preview generation. `AGENT_GEMINI_API_KEY` is injected into sandboxes as an environment variable and used by the Gemini CLI during task execution. Separating them allows independent rate limit tracking and lets you scope the agent key to a restricted quota.
+</Accordion>

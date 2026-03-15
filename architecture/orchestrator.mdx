@@ -1,0 +1,246 @@
+---
+title: "Orchestrator"
+description: "The core execution engine: how startTask claims tasks, provisions sandboxes, streams Gemini CLI output, and persists results."
+---
+
+The orchestrator lives in `src/lib/execution/orchestrator.ts`. It is the single coordination point between the database, E2B sandboxes, Gemini CLI, and GitHub.
+
+## In-Memory State
+
+```typescript
+type ProjectRunState = {
+  runningTaskId: string | null
+  sandboxId: string | null
+  starting: boolean
+}
+
+const projectState = new Map<string, ProjectRunState>()
+```
+
+The `projectState` map is an in-process guard that prevents two concurrent executions for the same project. Before any database operation is attempted, `startTask` checks this map. If `runningTaskId` or `starting` is truthy, the call returns immediately with `alreadyRunning: true`.
+
+<Warning>
+  The in-memory map is per-process. If you run multiple server instances, use the database-level `RUNNING` status check as the authoritative source of truth, not this map alone.
+</Warning>
+
+## `startTask`
+
+Entry point for all task execution. Called from server actions.
+
+```typescript
+export async function startTask(
+  projectId: string,
+  taskId?: string,
+): Promise<StartTaskResult>
+```
+
+<Steps>
+  <Step title="In-memory guard">
+    Checks `projectState.get(projectId)`. If `runningTaskId` or `starting` is set, returns `{ alreadyRunning: true }` immediately without hitting the database.
+  </Step>
+  <Step title="Set starting flag">
+    Sets `projectState` to `{ runningTaskId: null, sandboxId: null, starting: true }` to block any concurrent calls during setup.
+  </Step>
+  <Step title="Claim task">
+    Calls `claimTaskForExecution(projectId, taskId?)`. If `taskId` is provided, claims that specific task. Otherwise, calls `getNextRunnableTask` to find the next runnable task in dependency order.
+  </Step>
+  <Step title="Provision sandbox">
+    Calls `getOrCreateProjectSandbox(projectId, task.id)`. Returns an existing READY sandbox or creates a new E2B sandbox with the project repo cloned.
+  </Step>
+  <Step title="Emit task_started">
+    Fires `execution.task_started` on the Upstash Realtime channel so the UI can update immediately.
+  </Step>
+  <Step title="Fire-and-forget execution">
+    Calls `void runTaskExecution(projectId, task, sandboxId)` — non-blocking. `startTask` returns the `taskId` and `sandboxId` to the caller while execution continues asynchronously.
+  </Step>
+</Steps>
+
+## `claimTaskForExecution`
+
+Atomic task claiming with retry logic.
+
+```typescript
+async function claimTaskForExecution(
+  projectId: string,
+  taskId?: string,
+): Promise<TaskClaimResult>
+```
+
+When no `taskId` is specified, it loops up to `MAX_TASK_CLAIM_ATTEMPTS` (3) times:
+
+```typescript
+for (let attempt = 0; attempt < MAX_TASK_CLAIM_ATTEMPTS; attempt += 1) {
+  const task = await getNextRunnableTask(projectId)
+  if (!task) {
+    throw new Error('No runnable task found for this project')
+  }
+  const updated = await claimPendingTask(task.id)
+  if (updated) {
+    return { task }
+  }
+  // race condition: another process claimed it — retry
+}
+```
+
+If the loop exhausts all attempts, it checks the DB for a currently `RUNNING` task and returns `{ alreadyRunning: true, runningTaskId }` if one is found.
+
+## `getNextRunnableTask`
+
+Dependency-aware task selection. Queries all tasks sorted by `(phase, order)` and finds the first `PENDING` task whose dependencies are all `DONE` or `SKIPPED`:
+
+```typescript
+export async function getNextRunnableTask(
+  projectId: string,
+): Promise<Task | null> {
+  const allTasks = await db
+    .select()
+    .from(tasks)
+    .where(eq(tasks.projectId, projectId))
+    .orderBy(asc(tasks.phase), asc(tasks.order))
+
+  const statusById = new Map(allTasks.map((task) => [task.id, task.status]))
+  const isComplete = (status) => status === 'DONE' || status === 'SKIPPED'
+
+  let hasPriorIncomplete = false
+  return allTasks.find((task) => {
+    if (task.status !== 'PENDING') {
+      if (!isComplete(task.status)) hasPriorIncomplete = true
+      return false
+    }
+    if (hasPriorIncomplete) return false
+    const hasUnmetDependencies = !task.dependencies.every((id) =>
+      isComplete(statusById.get(id)),
+    )
+    if (hasUnmetDependencies) {
+      hasPriorIncomplete = true
+      return false
+    }
+    return true
+  }) ?? null
+}
+```
+
+## `runTaskExecution`
+
+The full async execution loop. Runs fire-and-forget after `startTask` returns.
+
+```typescript
+async function runTaskExecution(
+  projectId: string,
+  task: Task,
+  sandboxId: string,
+): Promise<void>
+```
+
+<Steps>
+  <Step title="Create task logger">
+    `createTaskLogger(task.id, projectId)` initialises a per-task log file at `logs/{taskId}.log`.
+  </Step>
+  <Step title="Sync repo">
+    `syncRepoToDefaultBranch(sandboxId, logger)` fetches origin, checks out the default branch, and fast-forward pulls to ensure the sandbox starts from the latest code.
+  </Step>
+  <Step title="Create run directory">
+    `mkdir -p $HOME/project/.dev0/runs/{task.id}` — the agent writes `agent-result.json` here.
+  </Step>
+  <Step title="Build prompt">
+    `buildTaskPrompt(project, task, runDir)` constructs the full agent prompt (see below).
+  </Step>
+  <Step title="Stream Gemini CLI">
+    `executeGeminiStreaming(sandboxId, { prompt, model, yolo: true, cwd })` streams JSONL output. Each line is parsed via `isGeminiEvent`, logged, and emitted to Upstash Realtime.
+  </Step>
+  <Step title="Persist logs">
+    `persistTaskLogs(task.id, collectedEvents, result.duration)` upserts all events to `task_logs`.
+  </Step>
+  <Step title="Read agent result">
+    `readAgentResult(sandboxId, agentResultPath)` reads `agent-result.json` written by the agent.
+  </Step>
+  <Step title="Finalize changes">
+    If exit code is 0, `finalizeTaskChanges(sandboxId, task, project, agentResult, logger)` runs the full git commit + push + PR creation sequence.
+  </Step>
+  <Step title="Complete task">
+    `completeTask(projectId, task.id, { success, prUrl })` updates the DB, emits a realtime event, and clears the in-memory state.
+  </Step>
+</Steps>
+
+## `buildTaskPrompt`
+
+Constructs the agent instruction injected into Gemini CLI:
+
+```typescript
+function buildTaskPrompt(
+  project: { id; name; description; repoUrl; repoName; techStack; specContent },
+  task: Task,
+  runDir: string,
+): string
+```
+
+The prompt includes:
+
+| Section | Content |
+|---|---|
+| Project info | Name, description, repo name/URL, tech stack |
+| Task info | Task ID, title, description, phase, order |
+| Project spec | Full `specContent` if present |
+| Requirements | Scoped implementation rules, tooling constraints, sandbox guardrails |
+| Output contract | Instruction to write `agent-result.json` with `{status, commitMessage, prTitle, prBody, notes}` |
+
+Key constraints injected into every prompt:
+- Do not run build commands or dev servers (they hang indefinitely)
+- Use `bun` for package management
+- Only run `bunx tsc --noEmit` for type checking
+- Do not run `git commit`, `git push`, or `gh pr create` (the orchestrator handles these)
+- Shadcn UI components are pre-installed; do not run the Shadcn CLI
+
+## `completeTask`
+
+```typescript
+export async function completeTask(
+  projectId: string,
+  taskId: string,
+  result: CompletionResult,
+): Promise<void>
+```
+
+Updates the task row and emits a realtime event:
+
+- **Success path**: sets `status = 'REVIEW'`, stores `prUrl`, emits `execution.task_review`
+- **Failure path**: sets `status = 'FAILED'`, increments `attempts` with `sql\`${tasks.attempts} + 1\``, emits `execution.task_failed`
+- Clears `projectState` entry so the next task can be claimed
+
+## `persistTaskLogs`
+
+```typescript
+async function persistTaskLogs(
+  taskId: string,
+  events: GeminiStreamEvent[],
+  durationMs: number,
+): Promise<void>
+```
+
+Iterates all collected events to extract stats:
+
+```typescript
+for (const event of events) {
+  if (event.type === 'result') { resultEvent = event; continue }
+  if (event.type === 'message' && event.role === 'assistant') {
+    lastAssistantMessage = event
+    if (!event.delta) lastAssistantFullMessage = event
+    continue
+  }
+  if (event.type === 'tool_use') { toolCallsCount += 1 }
+}
+```
+
+Then upserts to `task_logs` using `onConflictDoUpdate` (idempotent — can be called again on retry):
+
+```typescript
+await db
+  .insert(taskLogs)
+  .values({ taskId, events, summary, totalTokens, durationMs, toolCallsCount })
+  .onConflictDoUpdate({
+    target: taskLogs.taskId,
+    set: { events, summary, totalTokens, durationMs, toolCallsCount, updatedAt: new Date() },
+  })
+```
+
+The `summary` is truncated to 2000 characters to cap storage.

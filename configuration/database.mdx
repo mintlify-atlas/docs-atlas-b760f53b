@@ -1,0 +1,149 @@
+---
+title: "Database"
+description: "How Dev0 connects to PostgreSQL using Drizzle ORM, an overview of the schema, and commands for running and generating migrations."
+---
+
+Dev0 uses **PostgreSQL** as its primary data store and **Drizzle ORM** for type-safe query building and schema management.
+
+## Connection
+
+The database connection is configured with a single environment variable:
+
+```bash
+DATABASE_URL="postgresql://user:password@localhost:5432/dev0"
+```
+
+Drizzle reads this variable at startup via `drizzle.config.ts`. The config also supports a `DATABASE_PROVIDER` variable (default `supabase`) to select the connection URL source — useful when running alongside Supabase.
+
+<Note>
+  For production deployments on serverless platforms (Vercel, Netlify, etc.) Dev0 uses `@neondatabase/serverless` as the Postgres driver, which pools connections over WebSockets and HTTP to survive short-lived function invocations.
+</Note>
+
+## ORM: Drizzle
+
+Dev0 uses [Drizzle ORM](https://orm.drizzle.team) for all database interactions. The schema is defined in TypeScript at:
+
+```
+src/lib/db/schema.ts
+```
+
+Migration SQL files are generated into the `drizzle/` directory.
+
+## Schema overview
+
+The database contains four tables.
+
+### `projects`
+
+The top-level entity representing a product idea that Dev0 is building.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key |
+| `name` | `text` | Human-readable project name |
+| `description` | `text` | Optional project description |
+| `status` | `project_status` | `PLANNING` → `READY` → `ACTIVE` → `COMPLETED` / `PAUSED` / `ARCHIVED` |
+| `repo_url` | `text` | GitHub repository URL once created |
+| `repo_name` | `text` | Repository name under the bot account |
+| `tech_stack` | `text` | Tech stack slug (`react-vite`, `nextjs`, `tanstack-start`) |
+| `theme` | `text` | UI theme name (default `slate`) |
+| `vibe_input` | `text` | Raw user prompt that seeded the project |
+| `spec_content` | `text` | AI-generated product specification |
+| `created_at` | `timestamptz` | Creation timestamp |
+| `updated_at` | `timestamptz` | Last-updated timestamp |
+
+### `tasks`
+
+Individual coding tasks generated from the project spec. Each task maps to one pull request.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key |
+| `project_id` | `uuid` | Foreign key → `projects.id` (cascade delete) |
+| `title` | `text` | Short task title |
+| `description` | `text` | Detailed task description passed to the agent |
+| `phase` | `integer` | Execution phase for parallel scheduling (default `1`) |
+| `order` | `integer` | Order within a phase |
+| `status` | `task_status` | `PENDING` → `RUNNING` → `REVIEW` / `DONE` / `FAILED` / `SKIPPED` |
+| `gemini_model` | `gemini_model` | Model used to execute this task (`gemini-3-pro-preview` or `gemini-3-flash-preview`) |
+| `dependencies` | `text[]` | Array of task IDs that must complete first |
+| `pr_url` | `text` | GitHub PR URL once opened |
+| `pr_number` | `integer` | GitHub PR number |
+| `attempts` | `integer` | Number of execution attempts so far |
+| `max_attempts` | `integer` | Maximum allowed attempts before marking `FAILED` (default `3`) |
+| `created_at` | `timestamptz` | Creation timestamp |
+| `updated_at` | `timestamptz` | Last-updated timestamp |
+
+### `sandboxes`
+
+Tracks the E2B sandbox instances associated with each project.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key |
+| `project_id` | `uuid` | Foreign key → `projects.id` (cascade delete) |
+| `sandbox_id` | `text` | E2B sandbox identifier (unique) |
+| `status` | `sandbox_status` | `READY` / `RUNNING` / `STOPPED` |
+| `task_id` | `uuid` | Currently assigned task (unique — one task per sandbox at a time) |
+| `snapshot_id` | `text` | E2B template / snapshot name used to create this sandbox |
+| `public_url` | `text` | Public URL for the dev-server preview (if started) |
+| `created_at` | `timestamptz` | Creation timestamp |
+| `updated_at` | `timestamptz` | Last-updated timestamp |
+
+### `task_logs`
+
+Stores detailed execution telemetry for each task, kept in a separate table to avoid loading large JSON blobs on every task list query.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key |
+| `task_id` | `uuid` | Foreign key → `tasks.id` (cascade delete, unique) |
+| `events` | `jsonb` | Array of `GeminiStreamEvent` objects captured during execution |
+| `summary` | `text` | Final assistant message or completion summary |
+| `total_tokens` | `integer` | Total token count for the agent run |
+| `duration_ms` | `integer` | Wall-clock time of the agent run in milliseconds |
+| `tool_calls_count` | `integer` | Number of tool calls made by the agent |
+| `created_at` | `timestamptz` | Creation timestamp |
+| `updated_at` | `timestamptz` | Last-updated timestamp |
+
+## Migration commands
+
+<Steps>
+  <Step title="Apply pending migrations">
+    Run all pending SQL migrations against the database specified in `DATABASE_URL`:
+
+    ```bash
+    bun run db:migrate
+    ```
+
+    This calls `drizzle-kit migrate` and executes every `.sql` file in `drizzle/` that has not yet been applied.
+  </Step>
+
+  <Step title="Generate a new migration">
+    After editing `src/lib/db/schema.ts`, generate the corresponding SQL migration file:
+
+    ```bash
+    bun run db:generate
+    ```
+
+    Drizzle compares your schema to the current database state and writes a new SQL file to `drizzle/`.
+  </Step>
+
+  <Step title="Push schema without migrations (development only)">
+    For rapid local iteration you can push schema changes directly without generating a migration file:
+
+    ```bash
+    bun run db:push
+    ```
+
+    <Warning>
+      Do not use `db:push` in production — it applies changes destructively without a migration history.
+    </Warning>
+  </Step>
+</Steps>
+
+## Production considerations
+
+- **Connection pooling** — Use `@neondatabase/serverless` (already a dependency) or a PgBouncer-compatible connection string when deploying to serverless or edge environments to avoid exhausting the PostgreSQL connection limit.
+- **Cascade deletes** — The foreign keys on `tasks`, `sandboxes`, and `task_logs` all use `ON DELETE CASCADE`, so deleting a project removes all its associated data automatically.
+- **Indexes** — Performance indexes are defined on commonly queried columns: `projects.status`, `tasks.project_id`, `tasks.status`, `tasks.(project_id, phase, order)`, `sandboxes.project_id`, `sandboxes.status`, and `task_logs.task_id`.

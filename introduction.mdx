@@ -1,0 +1,76 @@
+---
+title: "Introduction"
+description: "Dev0 is the agentic engineering platform that turns product ideas into GitHub pull requests — powered by Gemini AI running in isolated sandboxes."
+---
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get your first project running and ship a PR in minutes
+  </Card>
+  <Card title="How it works" icon="circle-info" href="/how-it-works">
+    Understand the idea-to-PR pipeline end to end
+  </Card>
+  <Card title="Core features" icon="stars" href="/features/preview-agent">
+    Explore the agents, execution engine, and review flow
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Deep dive into the technical design and internals
+  </Card>
+</CardGroup>
+
+## What is Dev0?
+
+Dev0 is an **agentic engineering platform** inspired by the Ralph loop: let a code agent run until the task is actually done, but keep it contained, auditable, and reviewable.
+
+You provide a product idea. Dev0:
+
+1. Turns your idea into a structured project with a name, summary, and tech stack
+2. Generates a phased, dependency-aware task plan using Gemini 3 Pro
+3. Executes each task inside an isolated E2B sandbox running Gemini CLI
+4. Streams live logs back to your browser in real time
+5. Ships every completed task as a GitHub pull request — ready for your review
+
+Engineers stay in control as technical leads. Dev0 handles the execution.
+
+## Key differentiators
+
+<CardGroup cols={2}>
+  <Card title="Platform-controlled autonomy" icon="shield-check">
+    Agents run inside E2B sandboxes with strict orchestration and guardrails. No runaway processes.
+  </Card>
+  <Card title="PR-first workflow" icon="code-pull-request">
+    Every task ends with a reviewable GitHub pull request — your codebase stays clean.
+  </Card>
+  <Card title="Real-time visibility" icon="wave-pulse">
+    Live task logs and status updates via Upstash Realtime. Watch the agent work.
+  </Card>
+  <Card title="Human-in-the-loop" icon="user-check">
+    Approve, request changes, or merge from mission control. You decide what ships.
+  </Card>
+  <Card title="Gemini-native execution" icon="microchip-ai">
+    Gemini 3 Flash for instant previews; Gemini 3 Pro for deep planning and execution.
+  </Card>
+  <Card title="Isolated & reproducible" icon="box">
+    YOLO-mode agent execution is contained in fresh sandboxes — safe and repeatable.
+  </Card>
+</CardGroup>
+
+## Tech stack
+
+| Layer | Technology |
+|-------|-----------|
+| Frontend | React 19, TanStack Start, TanStack Router, Vite |
+| UI | shadcn/ui, Tailwind CSS, Motion, Lucide |
+| Backend | TanStack Start server actions, TypeScript |
+| Database | PostgreSQL, Drizzle ORM |
+| AI | Gemini 3 Pro/Flash, Vercel AI SDK, Gemini CLI |
+| Sandbox | E2B, Docker templates |
+| Realtime | Upstash Realtime, Upstash Redis |
+| Dev tools | Vitest, Prettier, Bun |
+
+## Use cases
+
+- **Solo engineers** — ship features by delegating tasks to agents while you review
+- **Startups** — reduce build time with PR-first automation and a visible audit trail
+- **Teams** — keep human review as the control plane for all AI-generated code
+- **Hackathon teams** — turn ideas into working code with live progress tracking

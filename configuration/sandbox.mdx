@@ -1,0 +1,151 @@
+---
+title: "Sandbox"
+description: "How Dev0 uses E2B cloud sandboxes to run Gemini coding agents in isolation, how to configure them, and how to build and publish the sandbox template."
+---
+
+Dev0 executes every coding task inside an isolated **E2B sandbox** — a short-lived cloud microVM with a full Linux environment. Sandboxes provide:
+
+- **Isolation** — agent code runs in its own filesystem, separate from your server and other projects.
+- **Internet access** — the agent can install packages, clone repos, and call APIs.
+- **Persistence within a project** — a sandbox is created once per project and reused across sequential tasks, so the working directory stays intact between runs.
+
+## Required configuration
+
+<CardGroup cols={2}>
+  <Card title="E2B_API_KEY" icon="key">
+    Your E2B API key, obtained from the E2B dashboard. This is the only hard requirement — without it Dev0 cannot create sandboxes.
+  </Card>
+  <Card title="E2B_TEMPLATE" icon="box">
+    The sandbox template to use. Defaults to `dev0-universal`, the custom template built by this project. Set this to your own template name after publishing a custom build.
+  </Card>
+</CardGroup>
+
+```bash
+E2B_API_KEY="e2b_..."
+E2B_TEMPLATE="dev0-universal"
+E2B_SANDBOX_TIMEOUT_MS="3600000"
+```
+
+### Sandbox timeout
+
+`E2B_SANDBOX_TIMEOUT_MS` controls how long E2B keeps a sandbox alive before automatically terminating it. The default is **3 600 000 ms (1 hour)**.
+
+<Tip>
+  For complex projects with many long-running tasks, increase this value to avoid sandbox timeouts mid-execution. E2B bills by uptime, so balance cost against task duration.
+</Tip>
+
+## The `dev0-universal` template
+
+Dev0 ships a custom E2B template defined in `e2b.toml` and built from `templates/e2b/e2b.Dockerfile`.
+
+| Property | Value |
+|---|---|
+| Template name | `dev0-universal` |
+| Template ID | `82cjfam0491ua8d0enim` |
+| Base image | `node:lts` |
+
+### What's inside the sandbox
+
+The Dockerfile installs the following tools on top of the Node LTS image:
+
+| Tool | Purpose |
+|---|---|
+| **Gemini CLI** (`@google/gemini-cli`) | The agentic coding engine — runs in `--yolo` mode to autonomously edit files and run commands |
+| **git** | Clone the project repo and push branches |
+| **gh** (GitHub CLI) | Open pull requests with `gh pr create` |
+| **bun** | Install JavaScript/TypeScript dependencies and run dev servers |
+| **ripgrep** | Fast file-content search used by the agent |
+| **jq** | JSON processing |
+
+The template also pre-configures a `~/.gemini/settings.json` file that sets `selectedAuthType` to `gemini-api-key` so the Gemini CLI authenticates via an API key rather than OAuth.
+
+## Building and publishing the template
+
+<Steps>
+  <Step title="Install the E2B CLI">
+    Install the E2B CLI globally if you haven't already:
+
+    ```bash
+    npm install -g e2b
+    ```
+
+    Then authenticate:
+
+    ```bash
+    e2b auth login
+    ```
+  </Step>
+
+  <Step title="Build the template">
+    Build the `dev0-universal` template from the Dockerfile:
+
+    ```bash
+    bun run template:build
+    ```
+
+    This runs:
+
+    ```bash
+    e2b template build -d templates/e2b/e2b.Dockerfile -n dev0-universal
+    ```
+
+    E2B builds the image and registers it under your account.
+  </Step>
+
+  <Step title="Publish the template">
+    Make the template publicly available (required if you want other users or CI environments to use it):
+
+    ```bash
+    bun run template:publish
+    ```
+
+    This runs:
+
+    ```bash
+    e2b template publish dev0-universal
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  After publishing a new template version, update `E2B_TEMPLATE` in your `.env.local` if you changed the template name, or rely on the template ID `82cjfam0491ua8d0enim` for pinned deployments.
+</Note>
+
+## Sandbox lifecycle
+
+The following describes how sandboxes are created and managed during a project run:
+
+<Steps>
+  <Step title="Project starts — sandbox created">
+    When the first task in a project begins executing, Dev0 calls `getOrCreateProjectSandbox`. A new E2B sandbox is spun up from the `dev0-universal` template.
+
+    On creation, the sandbox:
+    1. Clones the project's GitHub repository into `~/project`.
+    2. Writes Gemini CLI credentials to `~/.gemini/.env` and `~/project/.gemini/settings.json`.
+    3. Injects `GITHUB_TOKEN` and `AGENT_GEMINI_API_KEY` as environment variables.
+  </Step>
+
+  <Step title="Tasks execute — sandbox reused">
+    Sequential tasks for the same project reuse the existing sandbox. The agent checks out a new branch (`dev0/task-{taskId}`), makes its changes, and pushes.
+
+    If the sandbox has timed out or been stopped, Dev0 automatically creates a fresh one before retrying the task.
+  </Step>
+
+  <Step title="Task completes — PR opened">
+    After the agent finishes, Dev0 opens a GitHub pull request for the branch. The sandbox remains alive (within the timeout window) for subsequent tasks.
+  </Step>
+
+  <Step title="Project done — sandbox stopped">
+    When no more tasks remain, the sandbox is stopped via `betaPause()` (E2B's pause API) and its status is set to `STOPPED` in the database. Stopped sandboxes can be killed manually via `deleteSandbox`.
+  </Step>
+</Steps>
+
+## Sandbox database record
+
+Every sandbox is tracked in the `sandboxes` table. The `status` field reflects the current state:
+
+| Status | Meaning |
+|---|---|
+| `READY` | Sandbox is running and available for a task |
+| `RUNNING` | A task is actively executing inside the sandbox |
+| `STOPPED` | Sandbox has been paused or terminated |

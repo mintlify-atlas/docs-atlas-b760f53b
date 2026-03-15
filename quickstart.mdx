@@ -1,80 +1,220 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Set up Dev0 locally, create your first project, and ship a GitHub PR in under 15 minutes."
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
+Before you begin, make sure you have the following:
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Bun" icon="circle-b">
+    Runtime and package manager. Install from [bun.sh](https://bun.sh).
+  </Card>
+  <Card title="PostgreSQL" icon="database">
+    A running PostgreSQL instance. Local or hosted (e.g. Neon, Supabase).
+  </Card>
+  <Card title="E2B API key" icon="box">
+    Sandbox execution provider. Get one at [e2b.dev](https://e2b.dev).
+  </Card>
+  <Card title="Google Gemini API keys" icon="microchip-ai">
+    Two separate keys — one for server-side planning, one injected into sandboxes for agent execution.
+  </Card>
+  <Card title="Upstash Redis" icon="bolt">
+    Used for real-time pub/sub streaming. Create a database at [upstash.com](https://upstash.com).
+  </Card>
+  <Card title="GitHub token" icon="github">
+    A personal access token for a dedicated bot account. Dev0 uses this to create repos and open PRs.
+  </Card>
 </CardGroup>
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  Dev0 uses **two separate Gemini API keys** by design. `GOOGLE_GENERATIVE_AI_API_KEY` is used server-side by the planning agents. `AGENT_GEMINI_API_KEY` is injected into E2B sandboxes so the Gemini CLI can run autonomously without exposing your primary key.
 </Note>
+
+## Setup
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/manasseh-zw/dev0.git
+    cd dev0
+    ```
+  </Step>
+
+  <Step title="Install dependencies">
+    ```bash
+    bun install
+    ```
+  </Step>
+
+  <Step title="Configure environment variables">
+    Copy the example env file and fill in your values:
+
+    ```bash
+    cp .env.example .env.local
+    ```
+
+    Open `.env.local` and set each variable:
+
+    <CodeGroup>
+    ```bash .env.local
+    # Database (PostgreSQL)
+    DATABASE_URL="postgresql://user:password@localhost:5432/dev0"
+
+    # E2B Sandbox Orchestration
+    E2B_API_KEY=""                        # Your E2B API key
+    E2B_TEMPLATE="dev0-universal"         # Sandbox template name (default: dev0-universal)
+    E2B_SANDBOX_TIMEOUT_MS="3600000"      # Sandbox timeout in ms (default: 1 hour)
+
+    # Google Gemini — server-side planning agents (Vercel AI SDK)
+    GOOGLE_GENERATIVE_AI_API_KEY=""
+
+    # Google Gemini — injected into sandboxes for YOLO-mode Gemini CLI execution
+    AGENT_GEMINI_API_KEY=""
+
+    # GitHub Bot Account — used for repo creation and PR operations
+    GITHUB_TOKEN=""                       # Personal access token with repo scope
+    GITHUB_BOT_USERNAME="dev0-agent"      # Username of the bot account
+
+    # Application
+    APP_URL="http://localhost:3000"
+    NODE_ENV="development"
+
+    # Upstash Realtime (Redis) — for live log streaming
+    UPSTASH_REDIS_REST_URL=""
+    UPSTASH_REDIS_REST_TOKEN=""
+    ```
+    </CodeGroup>
+
+    | Variable | Description |
+    |---|---|
+    | `DATABASE_URL` | PostgreSQL connection string |
+    | `E2B_API_KEY` | E2B account API key for provisioning sandboxes |
+    | `E2B_TEMPLATE` | E2B sandbox template to use (default: `dev0-universal`) |
+    | `E2B_SANDBOX_TIMEOUT_MS` | Max sandbox lifetime in milliseconds |
+    | `GOOGLE_GENERATIVE_AI_API_KEY` | Gemini key used by the preview and planner agents via Vercel AI SDK |
+    | `AGENT_GEMINI_API_KEY` | Gemini key injected into E2B sandboxes for Gemini CLI execution |
+    | `GITHUB_TOKEN` | GitHub personal access token (bot account, needs `repo` scope) |
+    | `GITHUB_BOT_USERNAME` | GitHub username of the bot account that opens PRs |
+    | `APP_URL` | Base URL of the app (used for internal links) |
+    | `NODE_ENV` | `development` or `production` |
+    | `UPSTASH_REDIS_REST_URL` | Upstash Redis REST endpoint URL |
+    | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST auth token |
+
+    <Warning>
+      Keep `AGENT_GEMINI_API_KEY` separate from `GOOGLE_GENERATIVE_AI_API_KEY`. The agent key is passed into sandbox environments and should be treated as a credential with limited scope.
+    </Warning>
+  </Step>
+
+  <Step title="Run database migrations">
+    Apply the Drizzle ORM schema to your PostgreSQL database:
+
+    ```bash
+    bun run db:migrate
+    ```
+
+    This creates the `projects`, `tasks`, `sandboxes`, and `task_logs` tables.
+  </Step>
+
+  <Step title="Start the dev server">
+    ```bash
+    bun run dev
+    ```
+
+    The app is now running at **http://localhost:3000**.
+  </Step>
+</Steps>
+
+## Create your first project
+
+<Steps>
+  <Step title="Describe your idea">
+    Open **http://localhost:3000**. You'll land on the Dev0 home screen with a chat-style input field.
+
+    Type a product idea — be as descriptive or as rough as you like. For example:
+
+    > *A personal finance tracker with a dark UI, transaction categories, and a monthly spending chart.*
+
+    Press **Send**. Dev0 calls the Preview Agent (Gemini 3 Flash) to instantly generate a project name, tagline, description, and suggested tech stack.
+  </Step>
+
+  <Step title="Review and confirm the preview">
+    You're redirected to the **new project** page (`/new`) where the generated preview is pre-filled into the form.
+
+    Review and adjust:
+    - **Project Name** — auto-generated, editable
+    - **Description** — concise summary (max 350 characters, used as the GitHub repo description)
+    - **Tech Stack** — currently **React + Vite** (Next.js and TanStack Start are coming soon)
+
+    Click **Create Project** to proceed.
+  </Step>
+
+  <Step title="Wait for the plan to be generated">
+    Dev0 runs the Planner Agent (Gemini 3 Pro) in the background. It produces:
+
+    - A full **project specification** (overview, features, technical notes)
+    - A **phased task graph** of 5–20 atomic tasks with dependencies and model assignments
+    - A **README.md** committed to the new GitHub repository
+
+    Once complete, you're redirected to the project dashboard at `/project/:projectId`.
+
+    <Note>
+      A GitHub repository is automatically created under the bot account configured in `GITHUB_BOT_USERNAME`. The initial commit includes a README and a `TASKLIST.md`.
+    </Note>
+  </Step>
+</Steps>
+
+## Run your first task
+
+<Steps>
+  <Step title="Start execution from the project dashboard">
+    On the project dashboard, you'll see the full task board with all planned tasks grouped by phase. Tasks with unmet dependencies are shown as blocked.
+
+    Click **Start Execution** to have the orchestrator automatically pick the next runnable task. Dev0 will:
+
+    1. Claim the next `PENDING` task and mark it `RUNNING`
+    2. Provision an E2B sandbox and clone the repository into it
+    3. Run Gemini CLI in YOLO mode with a structured task prompt
+    4. Stream JSONL events live to your browser
+
+    You can watch the agent work in the live log panel.
+  </Step>
+
+  <Step title="Wait for the task to complete">
+    When the agent finishes, the orchestrator:
+
+    1. Commits all changes to a branch named `dev0/task-{taskId}`
+    2. Pushes the branch to GitHub
+    3. Opens a pull request using `gh pr create`
+    4. Transitions the task status to `REVIEW`
+
+    The task card updates in real time.
+  </Step>
+</Steps>
+
+## Review the generated PR
+
+Navigate to the **Review** tab in the project sidebar. You'll see a list of all pull requests opened by Dev0.
+
+From the review UI you can:
+
+- Read the PR title, description, and diff
+- See additions, deletions, and changed files
+- View comments from the agent and from GitHub
+- **Merge** the pull request directly (squash merge via the GitHub API)
+
+<Note>
+  Merging from the Dev0 UI calls `gh pr merge --squash` via the GitHub API and marks the task as `DONE` in the database.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="How it works" icon="circle-info" href="/how-it-works">
+    Understand the full idea-to-PR pipeline in detail
+  </Card>
+  <Card title="Task state machine" icon="diagram-project" href="/how-it-works#task-state-machine">
+    Learn how tasks move from PENDING to DONE
+  </Card>
+</CardGroup>

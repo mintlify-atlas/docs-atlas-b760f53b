@@ -1,0 +1,206 @@
+---
+title: "Google Cloud Run"
+description: "Deploy Dev0 to Google Cloud Run using Cloud Build for a fully managed, scalable deployment."
+---
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="gcloud CLI" icon="terminal">
+    Install the [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) and ensure `gcloud` is available in your PATH.
+  </Card>
+  <Card title="Google Cloud Project" icon="cloud">
+    Create a project in the [Google Cloud Console](https://console.cloud.google.com/) and note your **Project ID**.
+  </Card>
+</CardGroup>
+
+## Deployment Workflow
+
+<Steps>
+  <Step title="Authenticate with Google Cloud">
+    ```bash
+    gcloud auth login
+    gcloud config set project YOUR_PROJECT_ID
+    ```
+  </Step>
+
+  <Step title="Enable required APIs">
+    ```bash
+    gcloud services enable run.googleapis.com cloudbuild.googleapis.com
+    ```
+
+    This enables Cloud Run and Cloud Build, the two services required to build and host Dev0.
+  </Step>
+
+  <Step title="Build and push the container image">
+    Submit the build to Cloud Build, which builds the image from the Dockerfile and pushes it to Google Container Registry:
+
+    ```bash
+    gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/dev0 .
+    ```
+
+    <Note>
+      Replace `YOUR_PROJECT_ID` with your actual Google Cloud project ID throughout all commands.
+    </Note>
+  </Step>
+
+  <Step title="Deploy to Cloud Run">
+    Deploy the image with all required environment variables:
+
+    ```bash
+    gcloud run deploy dev0 \
+      --image gcr.io/YOUR_PROJECT_ID/dev0 \
+      --region us-central1 \
+      --allow-unauthenticated \
+      --port 3000 \
+      --set-env-vars DATABASE_URL=... \
+      --set-env-vars E2B_API_KEY=... \
+      --set-env-vars GOOGLE_GENERATIVE_AI_API_KEY=... \
+      --set-env-vars AGENT_GEMINI_API_KEY=... \
+      --set-env-vars GITHUB_TOKEN=... \
+      --set-env-vars UPSTASH_REDIS_REST_URL=... \
+      --set-env-vars UPSTASH_REDIS_REST_TOKEN=...
+    ```
+
+    <Warning>
+      Do not pass secrets directly via `--set-env-vars` in production. Use Cloud Run secrets or Secret Manager instead — see [Using Cloud Run Secrets](#using-cloud-run-secrets) below.
+    </Warning>
+  </Step>
+
+  <Step title="Access your deployment">
+    After a successful deploy, Cloud Run will print the service URL:
+
+    ```
+    Service URL: https://dev0-xxxxxxxxxx-uc.a.run.app
+    ```
+
+    Set this as your `APP_URL` environment variable and redeploy if your application depends on knowing its own public URL.
+  </Step>
+</Steps>
+
+## Using Cloud SQL for PostgreSQL
+
+For production deployments, Cloud SQL is the recommended managed PostgreSQL option.
+
+<Steps>
+  <Step title="Create a Cloud SQL instance">
+    ```bash
+    gcloud sql instances create dev0-db \
+      --database-version=POSTGRES_16 \
+      --tier=db-f1-micro \
+      --region=us-central1
+    ```
+  </Step>
+
+  <Step title="Create the database and user">
+    ```bash
+    gcloud sql databases create dev0 --instance=dev0-db
+    gcloud sql users create dev0user \
+      --instance=dev0-db \
+      --password=YOUR_DB_PASSWORD
+    ```
+  </Step>
+
+  <Step title="Connect Cloud Run to Cloud SQL">
+    Add the `--add-cloudsql-instances` flag and use the Unix socket connection string when deploying:
+
+    ```bash
+    gcloud run deploy dev0 \
+      --image gcr.io/YOUR_PROJECT_ID/dev0 \
+      --region us-central1 \
+      --add-cloudsql-instances YOUR_PROJECT_ID:us-central1:dev0-db \
+      --set-env-vars DATABASE_URL="postgresql://dev0user:YOUR_DB_PASSWORD@localhost/dev0?host=/cloudsql/YOUR_PROJECT_ID:us-central1:dev0-db" \
+      ...
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Cloud SQL incurs costs even when idle. For low-traffic or development deployments, consider using an external managed PostgreSQL service (e.g. Neon, Supabase, or Railway) with a standard `DATABASE_URL` connection string instead.
+</Warning>
+
+## Using Cloud Run Secrets
+
+Store sensitive values in Secret Manager and mount them as environment variables instead of passing them in plain text.
+
+<Steps>
+  <Step title="Store secrets in Secret Manager">
+    ```bash
+    echo -n "your-e2b-api-key" | \
+      gcloud secrets create E2B_API_KEY --data-file=-
+
+    echo -n "your-gemini-key" | \
+      gcloud secrets create GOOGLE_GENERATIVE_AI_API_KEY --data-file=-
+
+    # Repeat for each secret
+    ```
+  </Step>
+
+  <Step title="Grant the Cloud Run service account access">
+    ```bash
+    gcloud secrets add-iam-policy-binding E2B_API_KEY \
+      --member="serviceAccount:YOUR_PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+      --role="roles/secretmanager.secretAccessor"
+    ```
+  </Step>
+
+  <Step title="Reference secrets in your deployment">
+    ```bash
+    gcloud run deploy dev0 \
+      --image gcr.io/YOUR_PROJECT_ID/dev0 \
+      --region us-central1 \
+      --allow-unauthenticated \
+      --port 3000 \
+      --set-secrets E2B_API_KEY=E2B_API_KEY:latest \
+      --set-secrets GOOGLE_GENERATIVE_AI_API_KEY=GOOGLE_GENERATIVE_AI_API_KEY:latest \
+      --set-secrets AGENT_GEMINI_API_KEY=AGENT_GEMINI_API_KEY:latest \
+      --set-secrets GITHUB_TOKEN=GITHUB_TOKEN:latest \
+      --set-secrets UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest \
+      --set-env-vars DATABASE_URL=... \
+      --set-env-vars UPSTASH_REDIS_REST_URL=...
+    ```
+  </Step>
+</Steps>
+
+## Scaling Configuration
+
+Cloud Run scales to zero by default. Dev0 runs long-lived sandbox tasks that can take minutes, so configure minimum instances and memory to avoid cold start latency and premature termination.
+
+```bash
+gcloud run services update dev0 \
+  --region us-central1 \
+  --min-instances 1 \
+  --max-instances 10 \
+  --memory 1Gi \
+  --cpu 1 \
+  --timeout 3600
+```
+
+| Setting | Recommended | Reason |
+|---|---|---|
+| `--min-instances` | `1` | Avoids cold starts for interactive use |
+| `--max-instances` | `10` | Caps concurrent scaling to control costs |
+| `--memory` | `1Gi` | Sufficient for the Node.js/Bun server process |
+| `--timeout` | `3600` | Matches `E2B_SANDBOX_TIMEOUT_MS` (1 hour) for long-running agent tasks |
+
+<Warning>
+  Cloud Run has a maximum request timeout of 3600 seconds (1 hour). If your sandbox tasks regularly exceed this, consider offloading long-running orchestration to a separate worker service or Cloud Run Jobs.
+</Warning>
+
+## Environment Variable Reference
+
+All variables passed via `--set-env-vars` or `--set-secrets` during deployment:
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `E2B_API_KEY` | Yes | E2B sandbox API key |
+| `E2B_TEMPLATE` | No | Sandbox template name (default `dev0-universal`) |
+| `E2B_SANDBOX_TIMEOUT_MS` | No | Sandbox timeout in ms (default `3600000`) |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Yes | Gemini API key for planning/preview agents |
+| `AGENT_GEMINI_API_KEY` | Yes | Gemini API key injected into sandbox environments |
+| `GITHUB_TOKEN` | Yes | GitHub bot account token |
+| `GITHUB_BOT_USERNAME` | No | GitHub bot username (default `dev0-agent`) |
+| `UPSTASH_REDIS_REST_URL` | Yes | Upstash Redis REST URL |
+| `UPSTASH_REDIS_REST_TOKEN` | Yes | Upstash Redis REST token |
+| `APP_URL` | No | Public Cloud Run service URL |

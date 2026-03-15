@@ -1,0 +1,266 @@
+---
+title: "Execution"
+description: "How Dev0's orchestrator claims tasks, provisions E2B sandboxes, runs the Gemini CLI, and produces GitHub pull requests."
+---
+
+Execution is the engine of Dev0. Once a project has a task graph, the orchestrator picks up `PENDING` tasks one at a time, runs them inside an isolated E2B sandbox using the Gemini CLI, and ships the results as GitHub pull requests.
+
+## The orchestrator
+
+The orchestrator lives in `src/lib/execution/orchestrator.ts` and exposes two primary functions:
+
+<CardGroup cols={2}>
+  <Card title="startTask" icon="play">
+    Claims the next runnable `PENDING` task (or a specific task by ID), provisions a sandbox, and starts async execution. Returns immediately with the task ID and sandbox ID.
+  </Card>
+  <Card title="completeTask" icon="flag-checkered">
+    Called internally after execution finishes. Updates the task status to `REVIEW` or `FAILED`, persists the PR URL, and emits the appropriate realtime event.
+  </Card>
+</CardGroup>
+
+Execution is triggered from the project dashboard via the `startExecution` server action in `src/lib/actions/execution.ts`.
+
+## Task claiming
+
+Before any work starts, the orchestrator must claim a task using an atomic database update:
+
+```typescript
+async function claimPendingTask(taskId: string): Promise<boolean> {
+  const updated = await db
+    .update(tasks)
+    .set({ status: 'RUNNING' })
+    .where(and(eq(tasks.id, taskId), eq(tasks.status, 'PENDING')))
+    .returning()
+
+  return Boolean(updated[0])
+}
+```
+
+The `WHERE status = 'PENDING'` clause acts as an optimistic lock: only the first request that updates the row wins. If the update returns zero rows, the task was already claimed by another request and execution is aborted.
+
+If no specific `taskId` is provided, `getNextRunnableTask` selects the next eligible `PENDING` task ordered by phase and order. A task is runnable when:
+
+1. All entries in its `dependencies` array are `DONE` or `SKIPPED`
+2. No earlier task in the phase/order sequence is still incomplete
+
+The claim loop retries up to `MAX_TASK_CLAIM_ATTEMPTS` (3) times before failing, handling the case where a task transitions state between the lookup and the update.
+
+## Sandbox provisioning
+
+After a task is claimed, the orchestrator calls `getOrCreateProjectSandbox` from `src/lib/sandbox/provider`:
+
+```typescript
+const sandbox = await getOrCreateProjectSandbox(projectId, task.id)
+sandboxId = sandbox.id
+```
+
+This either returns an existing sandbox for the project or provisions a new one using the E2B SDK. Sandboxes use a `dev0-universal` template and have a configurable timeout (default 1 hour via `DEFAULT_COMMAND_TIMEOUT_MS`).
+
+Before execution begins, the orchestrator syncs the sandbox to the repository's default branch by running `git fetch origin --prune` and `git pull --ff-only`.
+
+## The task prompt
+
+`buildTaskPrompt` in `src/lib/execution/orchestrator.ts` assembles the prompt sent to the Gemini CLI. It injects:
+
+```
+Project: {name}
+Description: {description}
+Repo: {repoName}
+Repo URL: {repoUrl}
+Tech stack: react-vite (React + Vite)
+
+Task ID: {task.id}
+Title: {task.title}
+Description: {task.description}
+Phase: {task.phase}
+Order: {task.order}
+
+Project Spec:
+{specContent}
+```
+
+Followed by a detailed **requirements block** with sandbox constraints:
+
+<AccordionGroup>
+  <Accordion title="What the agent is allowed to do">
+    - Implement the single assigned task in the repo
+    - Follow guidance in `.dev0/RULES.md` if present
+    - Update `TASKLIST.md` and `LEARNINGS.md`
+    - Run `bunx tsc --noEmit` for type checking
+    - Use `bun install` and `bun run` for package management
+    - Add new packages via `bun add`
+    - Import from existing shadcn/ui components in `src/components/ui`
+  </Accordion>
+  <Accordion title="What the agent is explicitly prohibited from doing">
+    - Running `git commit`, `git push`, or `gh pr create` — the orchestrator handles this
+    - Running build commands (`bun run build`) or dev servers (`bun run dev`) — they hang indefinitely
+    - Running database migrations or schema generation commands
+    - Running integration tests requiring external services
+    - Making real network connections to external APIs
+    - Running `eslint` or `npx`
+    - Deleting `.gemini` temp directories
+  </Accordion>
+  <Accordion title="Required output">
+    The agent must write a JSON file at `{runDir}/agent-result.json` before finishing:
+
+    ```json
+    {
+      "status": "success",
+      "commitMessage": "feat: implement task title",
+      "prTitle": "feat: implement task title",
+      "prBody": "Description of changes...",
+      "notes": "Optional implementation notes"
+    }
+    ```
+
+    The orchestrator reads this file to populate the git commit and pull request.
+  </Accordion>
+</AccordionGroup>
+
+## Gemini CLI invocation
+
+The Gemini CLI is run inside the sandbox via `executeGeminiStreaming`:
+
+```typescript
+const result = await executeGeminiStreaming(
+  sandboxId,
+  {
+    prompt,
+    model: task.geminiModel,
+    yolo: true,
+    cwd: WORKSPACE_DIR,
+  },
+  { onStdout, onStderr, onComplete },
+)
+```
+
+Key parameters:
+
+- **`yolo: true`** — enables YOLO mode, which allows the agent to execute shell commands without prompting for confirmation
+- **`model: task.geminiModel`** — uses the model assigned to the task by the planner (`gemini-3-flash-preview` or `gemini-3-pro-preview`)
+- **`--output-format stream-json`** — emits one JSONL event per line to stdout for real-time parsing
+- **`cwd: '$HOME/project'`** — execution context is the synced repository directory
+
+## JSONL event streaming
+
+The Gemini CLI writes one JSON object per line to stdout. The orchestrator parses each line in the `onStdout` callback:
+
+```typescript
+const handleStdoutLine = (line: string) => {
+  if (!line.trim()) return
+  try {
+    const parsed = JSON.parse(line)
+    const geminiEvent = isGeminiEvent(parsed) ? parsed : undefined
+
+    if (geminiEvent) {
+      collectedEvents.push(geminiEvent)
+    }
+
+    const shouldEmit =
+      !(geminiEvent?.type === 'message' && geminiEvent.role === 'user')
+    if (shouldEmit) {
+      void getRealtimeChannel(projectId).emit('execution.task_log', {
+        projectId,
+        taskId: task.id,
+        log: line,
+        stream: 'stdout',
+        geminiEvent,
+      })
+    }
+  } catch {
+    // Non-JSON line — emit as plain log
+    void getRealtimeChannel(projectId).emit('execution.task_log', {
+      projectId,
+      taskId: task.id,
+      log: line,
+      stream: 'stdout',
+    })
+  }
+}
+```
+
+User messages (`type: 'message', role: 'user'`) are collected for persistence but not emitted to the UI — they contain the full prompt text and are too noisy to display.
+
+## The agent result file
+
+When the Gemini CLI exits with code `0`, the orchestrator reads `agent-result.json` from the sandbox run directory:
+
+```
+$HOME/project/.dev0/runs/{taskId}/agent-result.json
+```
+
+The file structure:
+
+```typescript
+{
+  status: 'success' | 'failed'
+  commitMessage?: string
+  prTitle?: string
+  prBody?: string
+  notes?: string
+}
+```
+
+If the file is absent or unparseable, the orchestrator falls back to a default commit message (`feat: complete task {title}`) and an empty PR body.
+
+## Finalizing and opening a PR
+
+After reading the agent result, `finalizeTaskChanges` handles the git workflow inside the sandbox:
+
+<Steps>
+  <Step title="Configure git identity">
+    Sets `user.email` to `dev0-agent@users.noreply.github.com` and `user.name` to `dev0-agent`.
+  </Step>
+  <Step title="Create branch">
+    Checks out a new branch named `dev0/task-{taskId}`.
+  </Step>
+  <Step title="Rebase onto default branch">
+    Fetches origin, detects the default branch, and rebases to stay current. If rebase fails, execution continues with a warning.
+  </Step>
+  <Step title="Stage and commit">
+    Runs `git add -A` then `git commit` with the message from `agent-result.json`.
+  </Step>
+  <Step title="Push">
+    Pushes the branch to the authenticated GitHub remote using `x-access-token` credentials.
+  </Step>
+  <Step title="Open pull request">
+    Runs `gh pr create` with the title and body from `agent-result.json`. The PR URL is extracted from the command output.
+  </Step>
+</Steps>
+
+## Error handling and retries
+
+Tasks support up to `maxAttempts` retries (default `3` in the database schema).
+
+When execution fails — non-zero exit code, sandbox error, or git/PR failure — the orchestrator:
+
+1. Calls `completeTask` with `success: false`
+2. Updates the task `status` to `FAILED`
+3. Increments the `attempts` counter via `sql\`${tasks.attempts} + 1\``
+4. Emits an `execution.task_failed` realtime event
+
+Failed tasks can be retried manually from the dashboard. On retry, `startExecution` claims the task again (it must first be reset to `PENDING`) and the full cycle repeats.
+
+<Warning>
+  If the sandbox fails to provision, the orchestrator marks the task `FAILED` immediately and emits `execution.task_failed` without attempting to run the agent.
+</Warning>
+
+## Log persistence
+
+After execution completes (success or failure), all collected `GeminiStreamEvent` objects are written to the `task_logs` table:
+
+```typescript
+await db
+  .insert(taskLogs)
+  .values({
+    taskId,
+    events,
+    summary: summary?.slice(0, 2000),
+    totalTokens: stats?.total_tokens ?? null,
+    durationMs: stats?.duration_ms ?? durationMs,
+    toolCallsCount,
+  })
+  .onConflictDoUpdate({ target: taskLogs.taskId, set: { events, ... } })
+```
+
+The `task_logs` table is separate from `tasks` for lazy loading — logs are only fetched when viewing task details, not when listing tasks.
